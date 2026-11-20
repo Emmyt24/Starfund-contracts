@@ -845,6 +845,79 @@ None — pure read; no auth required and no state mutation.
 
 ---
 
+## Paginated Read Consistency
+
+Several read views return **offset-paginated** slices of a mutable index:
+
+| View | Backing collection | Mutated by |
+|------|--------------------|------------|
+| `get_investors(start, limit)` | `DataKey::InvestorIndex` | `fund` (append), `unfund` / `refund` (contribution → 0) |
+| `get_allowlist_page(start, limit)` | `DataKey::Allowlist` | `add_to_allowlist` / `remove_from_allowlist` |
+| `get_yield_tiers_page(start, limit)` | `DataKey::YieldTierTable` | never (immutable after `init`) |
+
+**Offset pagination is not snapshot-isolated.** Each page is evaluated against the ledger
+state at the moment that page's read executes. There is no snapshot token, no cursor, and no
+version stamp tying successive pages together. If the underlying index mutates between two
+page reads, the concatenated result can **skip** or **repeat** entries.
+
+### Worked example: removal between pages
+
+Assume `get_investors` with `limit = 2` over an index of five addresses:
+
+```text
+index (before): [A, B, C, D, E]
+page 1: get_investors(0, 2) → [A, B]
+```
+
+Now `B` is removed from the index (its contribution drops to zero via `unfund`/`refund`, so
+`get_investors` no longer lists it). The index compacts:
+
+```text
+index (after):  [A, C, D, E]
+page 2: get_investors(2, 2) → [D, E]     // C is skipped: it shifted into offset 1
+```
+
+The naive concatenation `[A, B, D, E]` **silently omits `C`**. The mirror case — an insertion
+before the current offset — causes an entry to be **returned twice**. The same hazard applies
+to the allowlist: a `remove_from_allowlist` between pages shifts every later entry down by one,
+and an `add_to_allowlist` shifts them up by one. A swap-style removal (remove one address,
+add another in the same window) can produce both a skip and a duplicate in a single scan.
+
+### Ledger-pinned reads
+
+Where the host supports it, pin the whole scan to a single ledger:
+
+- **Simulation / `simulateTransaction`:** pass the same `ledger_sequence` (or the same
+  `LedgerInfo`) for every page so all pages observe one ledger state. Soroban simulation
+  accepts an explicit ledger override; use it rather than the "latest" default.
+- **Off-chain indexers:** read from a fixed ledger via the RPC `getLedgerEntries` /
+  historical-ledger endpoints, or replay from a captured ledger close, so the index cannot
+  move mid-scan.
+- **On-chain callers:** there is no snapshot token in the contract API. A single transaction
+  that reads all pages executes atomically against one ledger, but a multi-transaction scan
+  cannot be pinned on-chain — use the reconciliation recipe below.
+
+### Reconciliation / retry recipe
+
+Because offset scans can be inconsistent, clients must be able to **detect** a bad scan and
+**retry** it. Recommended procedure:
+
+1. **Capture a boundary signal before the scan.** Record `get_unique_funder_count()` (for
+   `get_investors`) or the allowlist length, plus the current ledger sequence.
+2. **Page through** with `start += limit` until a page returns fewer than `limit` entries.
+3. **Re-read the boundary signal after the scan.** If the count or ledger sequence changed,
+   the scan spanned a mutation — **discard it and retry** from offset `0`.
+4. **Cross-check the total.** The number of distinct addresses collected must equal the
+   post-scan count. A mismatch (skip or duplicate) means the scan is inconsistent; retry.
+5. **Deduplicate defensively.** If a retry is not possible, deduplicate by address and treat
+   any shortfall against the boundary count as an error rather than a complete result.
+
+A scan is only trustworthy when the boundary signal is unchanged across the whole scan, or
+when every page was pinned to the same ledger. Never treat a single unpinned multi-page scan
+as an authoritative snapshot.
+
+---
+
 ## `get_yield_tiers() → Vec<YieldTier>`
 
 **Storage key:** `DataKey::YieldTierTable`
@@ -871,6 +944,64 @@ Returns a read-only paginated view of the configured yield-tier ladder using the
 |-------|------|-------------|
 | `min_lock_secs` | `u64` | Minimum `committed_lock_secs` an investor must pass to qualify for this tier |
 | `yield_bps` | `i64` | Effective annualized yield in basis points for qualifying investors |
+
+## `get_rent_bump_plan() → RentBumpPlan`
+
+**Signature:** `pub fn get_rent_bump_plan(env: Env) -> RentBumpPlan`
+
+Returns a read-only plan describing which storage keys are **present** and how they relate to
+the configured rent-bump threshold. It is a planning aid for operators; it does **not** measure
+remaining TTL.
+
+### `RentBumpPlan` fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `contribution_ttl` | `u32` | **Presence sentinel, not a measured TTL.** `1` when the contribution key is present, `0` when absent. It is **not** a count of remaining ledgers. |
+| `threshold` | `u32` | The configured bump threshold used for the `Warning` policy below. |
+| `status` | `RentBumpStatus` | `Ok` or `Warning`, derived from presence and threshold (see policy). |
+
+> **⚠️ `contribution_ttl` is a sentinel.** Despite the name, it is only ever `0` or `1`. Do not
+> interpret it as remaining ledgers, seconds, or any measured duration. Real TTL must be
+> fetched from the RPC (`getLedgerEntries` returns `liveUntilLedgerSeq` per key) and compared
+> against the current ledger sequence off-chain.
+
+### Warning policy
+
+The `status` field is computed from **presence only**, not from measured TTL:
+
+| `threshold` | Key present | `contribution_ttl` | `status` |
+|-------------|-------------|--------------------|----------|
+| `0` | yes | `1` | `Ok` |
+| `0` | no | `0` | `Ok` |
+| nonzero | yes | `1` | `Warning` |
+| nonzero | no | `0` | `Ok` |
+
+With a nonzero threshold, **every present key is `Warning`** regardless of its actual remaining
+TTL — the plan cannot distinguish a key that expires next ledger from one that is fresh. With
+`threshold == 0`, `Warning` is never emitted. Over identical present keys, changing only the
+threshold flips the status from `Ok` to `Warning`; this is expected and reflects presence, not
+urgency.
+
+### RPC TTL lookup
+
+To obtain the real remaining TTL, query the RPC for the key's `liveUntilLedgerSeq` and subtract
+the current ledger sequence:
+
+```text
+remaining_ledgers = liveUntilLedgerSeq - current_ledger_sequence
+```
+
+Use this value — not `contribution_ttl` — to decide whether a bump is actually needed.
+
+### Planned API evolution
+
+A future compatible release will add a clearly named presence field (e.g. `is_present: bool`)
+so callers no longer have to read the sentinel semantics out of `contribution_ttl`. The existing
+field will be retained for backward compatibility; new integrations should prefer the presence
+field once available.
+
+---
 
 ## `get_collateral_state() → CollateralState`
 

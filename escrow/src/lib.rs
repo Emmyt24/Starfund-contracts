@@ -113,9 +113,21 @@
 //!
 //! ## Funding-close snapshot (pro-rata)
 //!
-//! When status first becomes **funded**, [`DataKey::FundingCloseSnapshot`] stores total principal
-//! (including over-funding past target), the target, and ledger timestamp/sequence. **Immutable** once
-//! written; see `docs/escrow-pro-rata.md` for the authoritative pro-rata payout math and rounding rules.
+//! [`DataKey::FundingCloseSnapshot`] is written by **exactly four** production paths. Every writer
+//! records the same shape (total principal including over-funding past target, the target in force
+//! at close, and ledger timestamp/sequence) and the snapshot is **immutable** once written:
+//!
+//! | Writer | Trigger | Recorded `target` | Recorded `total_principal` |
+//! |--------|---------|-------------------|----------------------------|
+//! | [`StarfundEscrow::fund`] | deposit crosses the target (status `0` ΓåÆ `1`) | current `funding_target` | `funded_amount` after the deposit |
+//! | [`StarfundEscrow::fund_with_commitment`] | first deposit crosses the target | current `funding_target` | `funded_amount` after the deposit |
+//! | [`StarfundEscrow::partial_settle`] | admin closes funding early (status `0` ΓåÆ `1`) | current `funding_target` | `funded_amount` at close (must be `> 0`) |
+//! | [`StarfundEscrow::update_funding_target`] | admin lowers the target to or below `funded_amount` | the **new** (lowered) target | `funded_amount` at close |
+//!
+//! The first two are **deposit closes** (a threshold-crossing deposit); the last two are
+//! **administrative closes** that produce a snapshot without any new deposit. Auditors must not
+//! assume a snapshot implies a deposit event. See `docs/escrow-snapshot.md` for the lifecycle and
+//! `docs/escrow-pro-rata.md` for the authoritative pro-rata payout math and rounding rules.
 //! Off-chain share for an investor is `get_contribution(addr) / snapshot.total_principal`.
 //!
 //! ## Immutable protocol fee (SME disbursement split)
@@ -10582,6 +10594,22 @@ impl StarfundEscrow {
 
     /// Read-only view returning the registered callback context for a given invocation `nonce`.
     /// Returns `None` if no callback was registered with this nonce.
+    ///
+    /// # Paginated reads are not snapshot-isolated
+    ///
+    /// Offset-based paginated getters (for example [`StarfundEscrow::get_investors`]) read the
+    /// live index on every call and carry **no snapshot token**. If the index mutates between
+    /// two page reads ΓÇö an allowlist removal, an `unfund`, or a new investor ΓÇö later offsets
+    /// shift and a naive scan can **skip or repeat** entries. Clients must either:
+    ///
+    /// 1. pin every page read to a single ledger (simulate all pages against the same ledger
+    ///    sequence when the RPC supports ledger-pinned simulation), or
+    /// 2. reconcile across ledgers: record the ledger sequence of each page, and if it changes
+    ///    mid-scan, discard the scan and retry from offset `0` (bounded retries).
+    ///
+    /// Example: investors `[A, B, C]` are read with `limit = 2` ΓåÆ page 1 `[A, B]`. If `A` is
+    /// removed before page 2, the index becomes `[B, C]` and offset `2` returns `[]`, silently
+    /// dropping `C`. Retrying the whole scan after the mutation yields `[B, C]`.
     pub fn get_callback(env: Env, nonce: u64) -> Option<CallbackContext> {
         env.storage()
             .instance()
@@ -10590,6 +10618,9 @@ impl StarfundEscrow {
 
     /// Read-only view returning the current callback invocation nonce counter.
     /// Returns `0` if no callbacks have been registered.
+    ///
+    /// See [`StarfundEscrow::get_callback`] for the paginated-read consistency contract that
+    /// applies to all offset-based getters.
     pub fn get_callback_nonce(env: Env) -> u64 {
         env.storage()
             .instance()
@@ -10599,6 +10630,9 @@ impl StarfundEscrow {
 
     /// Read-only view returning whether the callback for `nonce` has been consumed.
     /// Returns `false` if the callback is unconsumed or does not exist.
+    ///
+    /// See [`StarfundEscrow::get_callback`] for the paginated-read consistency contract that
+    /// applies to all offset-based getters.
     pub fn is_callback_consumed(env: Env, nonce: u64) -> bool {
         let context: Option<CallbackContext> = env
             .storage()
@@ -10768,6 +10802,86 @@ mod init_reentry_guard_tests {
                 ensure_not_initialized(&env);
             }));
             assert!(result.is_err());
+        });
+    }
+}
+
+#[cfg(test)]
+mod rent_plan_presence_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    /// `contribution_ttl` is a **presence sentinel** (0 or 1), never a measured TTL.
+    /// With a nonzero threshold every present key is `Warning`; with threshold zero
+    /// no key is `Warning`. The two runs use identical present keys.
+    #[test]
+    fn contribution_ttl_is_presence_sentinel_for_zero_and_nonzero_threshold() {
+        let env = Env::default();
+        let contract_id = env.register(StarfundEscrow, ());
+        env.as_contract(&contract_id, || {
+            let investor = Address::generate(&env);
+            env.storage()
+                .persistent()
+                .set(&DataKey::InvestorContribution(investor.clone()), &500i128);
+
+            let with_threshold = StarfundEscrow::get_rent_bump_plan(env.clone(), 1);
+            let without_threshold = StarfundEscrow::get_rent_bump_plan(env.clone(), 0);
+
+            assert_eq!(with_threshold.len(), without_threshold.len());
+            for i in 0..with_threshold.len() {
+                let a = with_threshold.get(i).unwrap();
+                let b = without_threshold.get(i).unwrap();
+                // Presence sentinel is identical regardless of threshold.
+                assert_eq!(a.contribution_ttl, b.contribution_ttl);
+                assert!(a.contribution_ttl == 0 || a.contribution_ttl == 1);
+                // Warning policy: nonzero threshold warns on every present key.
+                assert!(a.warning);
+                assert!(!b.warning);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod paginated_views_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    /// Offset pagination is not snapshot-isolated: removing an entry between pages
+    /// shifts later offsets. This locks in the documented removal-between-pages example.
+    #[test]
+    fn removal_between_pages_shifts_offsets() {
+        let env = Env::default();
+        let contract_id = env.register(StarfundEscrow, ());
+        env.as_contract(&contract_id, || {
+            let a = Address::generate(&env);
+            let b = Address::generate(&env);
+            let c = Address::generate(&env);
+            let mut list = Vec::new(&env);
+            list.push_back(a.clone());
+            list.push_back(b.clone());
+            list.push_back(c.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::InvestorAllowlist, &list);
+
+            let page1 = StarfundEscrow::get_investors(env.clone(), 0, 2);
+            assert_eq!(page1.len(), 2);
+
+            // Remove `a` between pages: index becomes [b, c].
+            let mut shifted = Vec::new(&env);
+            shifted.push_back(b.clone());
+            shifted.push_back(c.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::InvestorAllowlist, &shifted);
+
+            let page2 = StarfundEscrow::get_investors(env.clone(), 2, 2);
+            assert_eq!(page2.len(), 0);
+
+            // Retry from offset 0 yields the reconciled set.
+            let retry = StarfundEscrow::get_investors(env.clone(), 0, 2);
+            assert_eq!(retry.len(), 2);
         });
     }
 }

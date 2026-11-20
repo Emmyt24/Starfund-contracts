@@ -29,8 +29,8 @@
 use soroban_sdk::{testutils::Address as _, Address, Env, String, Symbol, Vec};
 
 use super::{
-    keys, StarfundEscrow, StarfundEscrowClient, MAX_INVESTOR_READ_BATCH,
-    MAX_UNIQUE_INVESTORS, WORST_CASE_RELEASE_CPU_INSNS_CEILING,
+    keys, StarfundEscrow, StarfundEscrowClient, MAX_ATTESTATION_APPEND_ENTRIES,
+    MAX_INVESTOR_READ_BATCH, MAX_UNIQUE_INVESTORS, WORST_CASE_RELEASE_CPU_INSNS_CEILING,
     WORST_CASE_RELEASE_MEM_BYTES_CEILING,
 };
 
@@ -226,6 +226,138 @@ fn max_participants_hard_cap_is_enforced() {
     // No partial mutation: the rejected investor has no contribution, count is unchanged.
     assert_eq!(client.get_contribution(&over_cap), 0i128);
     assert_eq!(client.get_unique_funder_count(), MAX_UNIQUE_INVESTORS);
+}
+
+/// Documented CPU-instruction ceiling for a single attestation-log operation measured at the
+/// existing [`crate::MAX_ATTESTATION_APPEND_ENTRIES`] (32-entry) ceiling. Loose, conservative
+/// gate (native metering underestimates WASM cost) — see the release-budget constant docs.
+const ATTESTATION_LOG_CPU_INSNS_CEILING: u64 = 50_000_000;
+
+/// Documented memory-bytes ceiling for a single attestation-log operation at the 32-entry
+/// ceiling (same conservative rationale as [`ATTESTATION_LOG_CPU_INSNS_CEILING`]).
+const ATTESTATION_LOG_MEM_BYTES_CEILING: u64 = 5_000_000;
+
+/// Documented ceiling for the serialized ledger entry size (bytes) of the attestation log at
+/// the 32-entry ceiling. Each entry is a 32-byte digest plus small vector overhead, so 32
+/// entries must stay well under this bound.
+const ATTESTATION_LOG_ENTRY_BYTES_CEILING: u64 = 4_096;
+
+/// Build a 32-byte digest for entry `i` (deterministic, distinct per index).
+fn attestation_digest(env: &Env, i: u32) -> soroban_sdk::BytesN<32> {
+    let mut bytes = [0u8; 32];
+    bytes[0..4].copy_from_slice(&i.to_be_bytes());
+    bytes[31] = 0xAB;
+    soroban_sdk::BytesN::from_array(env, &bytes)
+}
+
+/// Measure the serialized ledger entry size (bytes) of the attestation append log.
+fn attestation_log_entry_bytes(env: &Env, id: &Address) -> u64 {
+    env.as_contract(id, || {
+        let key = keys::attestation_append_log();
+        let entry = env.storage().instance().get::<_, Vec<soroban_sdk::BytesN<32>>>(&key);
+        match entry {
+            Some(v) => v.len() as u64 * 32,
+            None => 0,
+        }
+    })
+}
+
+/// Edge case — **attestation append-log ceiling** (issue #424): at the existing
+/// [`crate::MAX_ATTESTATION_APPEND_ENTRIES`] (32-entry) limit, appending, paginated reads via
+/// [`StarfundEscrow::get_attestation_digests`] and batch revocation via
+/// [`StarfundEscrow::revoke_attestation_digests`] all stay within documented CPU/memory/entry
+/// budgets. Exactly 32 entries are supported; the 33rd append retains its typed rejection.
+#[test]
+fn attestation_log_ceiling_stays_within_documented_budget() {
+    let env = Env::default();
+    let (client, id) = deploy(&env, 1_000_000i128);
+    env.mock_all_auths_allowing_non_root_auth();
+
+    // Append exactly MAX_ATTESTATION_APPEND_ENTRIES entries, measuring the worst-case append.
+    let mut last_append = Measured { cpu_insns: 0, mem_bytes: 0 };
+    for i in 0..MAX_ATTESTATION_APPEND_ENTRIES {
+        let digest = attestation_digest(&env, i);
+        last_append = measure(&env, || {
+            client.append_attestation_digest(&digest);
+        });
+    }
+    assert!(
+        last_append.cpu_insns < ATTESTATION_LOG_CPU_INSNS_CEILING,
+        "append at ceiling: CPU instructions {cpu} exceeded documented ceiling {ceil}",
+        cpu = last_append.cpu_insns,
+        ceil = ATTESTATION_LOG_CPU_INSNS_CEILING
+    );
+    assert!(
+        last_append.mem_bytes < ATTESTATION_LOG_MEM_BYTES_CEILING,
+        "append at ceiling: memory bytes {mem} exceeded documented ceiling {ceil}",
+        mem = last_append.mem_bytes,
+        ceil = ATTESTATION_LOG_MEM_BYTES_CEILING
+    );
+
+    // Exactly 32 entries are supported.
+    assert_eq!(
+        client.get_attestation_digest_count(),
+        MAX_ATTESTATION_APPEND_ENTRIES,
+        "exactly MAX_ATTESTATION_APPEND_ENTRIES entries must be supported"
+    );
+
+    // Ledger entry size at the ceiling stays within the documented bound.
+    let entry_bytes = attestation_log_entry_bytes(&env, &id);
+    assert!(
+        entry_bytes <= ATTESTATION_LOG_ENTRY_BYTES_CEILING,
+        "attestation log entry size {entry_bytes} exceeded documented ceiling {ceil}",
+        ceil = ATTESTATION_LOG_ENTRY_BYTES_CEILING
+    );
+
+    // Paginated reads at the ceiling stay within budget.
+    let page = measure(&env, || {
+        let _ = client.get_attestation_digests(&0u32, &MAX_ATTESTATION_APPEND_ENTRIES);
+    });
+    assert!(
+        page.cpu_insns < ATTESTATION_LOG_CPU_INSNS_CEILING,
+        "get_attestation_digests at ceiling: CPU instructions {cpu} exceeded documented ceiling {ceil}",
+        cpu = page.cpu_insns,
+        ceil = ATTESTATION_LOG_CPU_INSNS_CEILING
+    );
+    assert!(
+        page.mem_bytes < ATTESTATION_LOG_MEM_BYTES_CEILING,
+        "get_attestation_digests at ceiling: memory bytes {mem} exceeded documented ceiling {ceil}",
+        mem = page.mem_bytes,
+        ceil = ATTESTATION_LOG_MEM_BYTES_CEILING
+    );
+
+    // The 33rd append retains its existing typed rejection.
+    let overflow = attestation_digest(&env, MAX_ATTESTATION_APPEND_ENTRIES);
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.append_attestation_digest(&overflow);
+    }));
+    assert!(res.is_err(), "the 33rd append must be rejected");
+    assert_eq!(
+        client.get_attestation_digest_count(),
+        MAX_ATTESTATION_APPEND_ENTRIES,
+        "rejected append must not mutate the log"
+    );
+
+    // Batch revocation of all 32 entries stays within budget.
+    let mut digests: Vec<soroban_sdk::BytesN<32>> = Vec::new(&env);
+    for i in 0..MAX_ATTESTATION_APPEND_ENTRIES {
+        digests.push_back(attestation_digest(&env, i));
+    }
+    let revoke = measure(&env, || {
+        client.revoke_attestation_digests(&digests);
+    });
+    assert!(
+        revoke.cpu_insns < ATTESTATION_LOG_CPU_INSNS_CEILING,
+        "revoke_attestation_digests at ceiling: CPU instructions {cpu} exceeded documented ceiling {ceil}",
+        cpu = revoke.cpu_insns,
+        ceil = ATTESTATION_LOG_CPU_INSNS_CEILING
+    );
+    assert!(
+        revoke.mem_bytes < ATTESTATION_LOG_MEM_BYTES_CEILING,
+        "revoke_attestation_digests at ceiling: memory bytes {mem} exceeded documented ceiling {ceil}",
+        mem = revoke.mem_bytes,
+        ceil = ATTESTATION_LOG_MEM_BYTES_CEILING
+    );
 }
 
 /// Edge case — **repeated releases**: a repeated `claim_investor_payout` for the same investor

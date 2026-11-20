@@ -53,6 +53,51 @@ jobs:
             --fail-under-lines 90 \
             -p starfund_escrow
 
+  wasm-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.1
+          targets: wasm32v1-none
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build production WASM (no testutils)
+        run: cargo build --target wasm32v1-none --release --no-default-features -p starfund_escrow
+
+      - name: Inspect production dependency graph
+        run: |
+          cargo tree --target wasm32v1-none -p starfund_escrow --no-default-features \
+            --edges normal,build > production-tree.txt
+          echo "--- Production graph (wasm32v1-none, no-default-features) ---"
+          cat production-tree.txt
+
+      - name: Compare against testutils graph
+        run: |
+          cargo tree --target wasm32v1-none -p starfund_escrow --features testutils \
+            --edges normal,build > testutils-tree.txt
+          echo "--- Testutils graph (wasm32v1-none, features=testutils) ---"
+          cat testutils-tree.txt
+          echo "--- Diff (production vs testutils) ---"
+          diff -u production-tree.txt testutils-tree.txt || true
+
+      - name: Assert production graph excludes test-only facilities
+        run: |
+          # Native test-only facilities must never leak into the production graph.
+          # Keep this list in sync with the testutils feature boundary in escrow/Cargo.toml.
+          FORBIDDEN='testutils|soroban-sdk.*testutils|rand|getrandom|ed25519-dalek|proptest|mockall'
+          if grep -Eiq "$FORBIDDEN" production-tree.txt; then
+            echo "::error::Production WASM dependency graph contains test-only/native facilities:"
+            grep -Ein "$FORBIDDEN" production-tree.txt
+            exit 1
+          fi
+          echo "OK: production graph is free of testutils and native test-only facilities."
+
   cargo-audit:
     runs-on: ubuntu-latest
     steps:

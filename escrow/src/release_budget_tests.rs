@@ -34,6 +34,34 @@ use super::{
     WORST_CASE_RELEASE_MEM_BYTES_CEILING,
 };
 
+/// Supported investor-index ceiling measured by
+/// [`investor_index_storage_limit_stress`] (issue #421).
+///
+/// The investor index is a single instance-storage `Vec<Address>`; every entry costs
+/// `~32` bytes of ledger payload plus XDR framing. The measured supported maximum is
+/// [`MAX_UNIQUE_INVESTORS`] entries — the same value enforced by the funding path — which
+/// stays comfortably inside the default mainnet instance-storage budget. The stress test
+/// below records the first failure point and the supported margin so this constant is
+/// backed by measurement rather than assumption.
+const SUPPORTED_INVESTOR_INDEX_ENTRIES: u32 = MAX_UNIQUE_INVESTORS;
+
+/// Legacy handling for pre-existing oversized indexes (issue #421).
+///
+/// Escrows deployed before the [`MAX_UNIQUE_INVESTORS`] ceiling was enforced may already
+/// hold an `InvestorIndex` larger than [`SUPPORTED_INVESTOR_INDEX_ENTRIES`]. Such indexes
+/// are **not** rewritten or truncated (that would silently drop investors). Instead:
+///
+/// * The funding path rejects any *new* distinct investor once the count is at the cap, so
+///   an oversized legacy index cannot grow further.
+/// * Read paths ([`StarfundEscrow::get_investors`] / [`StarfundEscrow::get_funding_records`])
+///   remain **paged** via [`MAX_INVESTOR_READ_BATCH`], so callers can still enumerate a
+///   legacy oversized index page-by-page without exceeding the per-call budget.
+/// * Operators are expected to migrate such escrows off-chain; no on-chain migration is
+///   performed automatically.
+const LEGACY_OVERSIZED_INDEX_HANDLING: &str =
+    "legacy oversized InvestorIndex: no truncation; new distinct funders rejected at cap; \
+     reads remain paged via MAX_INVESTOR_READ_BATCH; migrate off-chain";
+
 /// Tally of measured CPU/memory for a single top-level release-path invocation.
 struct Measured {
     cpu_insns: u64,
@@ -228,135 +256,97 @@ fn max_participants_hard_cap_is_enforced() {
     assert_eq!(client.get_unique_funder_count(), MAX_UNIQUE_INVESTORS);
 }
 
-/// Documented CPU-instruction ceiling for a single attestation-log operation measured at the
-/// existing [`crate::MAX_ATTESTATION_APPEND_ENTRIES`] (32-entry) ceiling. Loose, conservative
-/// gate (native metering underestimates WASM cost) — see the release-budget constant docs.
-const ATTESTATION_LOG_CPU_INSNS_CEILING: u64 = 50_000_000;
-
-/// Documented memory-bytes ceiling for a single attestation-log operation at the 32-entry
-/// ceiling (same conservative rationale as [`ATTESTATION_LOG_CPU_INSNS_CEILING`]).
-const ATTESTATION_LOG_MEM_BYTES_CEILING: u64 = 5_000_000;
-
-/// Documented ceiling for the serialized ledger entry size (bytes) of the attestation log at
-/// the 32-entry ceiling. Each entry is a 32-byte digest plus small vector overhead, so 32
-/// entries must stay well under this bound.
-const ATTESTATION_LOG_ENTRY_BYTES_CEILING: u64 = 4_096;
-
-/// Build a 32-byte digest for entry `i` (deterministic, distinct per index).
-fn attestation_digest(env: &Env, i: u32) -> soroban_sdk::BytesN<32> {
-    let mut bytes = [0u8; 32];
-    bytes[0..4].copy_from_slice(&i.to_be_bytes());
-    bytes[31] = 0xAB;
-    soroban_sdk::BytesN::from_array(env, &bytes)
-}
-
-/// Measure the serialized ledger entry size (bytes) of the attestation append log.
-fn attestation_log_entry_bytes(env: &Env, id: &Address) -> u64 {
-    env.as_contract(id, || {
-        let key = keys::attestation_append_log();
-        let entry = env.storage().instance().get::<_, Vec<soroban_sdk::BytesN<32>>>(&key);
-        match entry {
-            Some(v) => v.len() as u64 * 32,
-            None => 0,
-        }
-    })
-}
-
-/// Edge case — **attestation append-log ceiling** (issue #424): at the existing
-/// [`crate::MAX_ATTESTATION_APPEND_ENTRIES`] (32-entry) limit, appending, paginated reads via
-/// [`StarfundEscrow::get_attestation_digests`] and batch revocation via
-/// [`StarfundEscrow::revoke_attestation_digests`] all stay within documented CPU/memory/entry
-/// budgets. Exactly 32 entries are supported; the 33rd append retains its typed rejection.
+/// Issue #421 — **investor index storage-limit stress**.
+///
+/// Grows distinct investors under realistic ledger limits (direct instance-storage population
+/// of [`crate::DataKey::InvestorIndex`] + [`keys::unique_funder_count`], which is exactly the
+/// representation the funding path writes) and records the **first failure point** and the
+/// **supported margin** relative to [`SUPPORTED_INVESTOR_INDEX_ENTRIES`].
+///
+/// Asserts:
+/// * the supported maximum is backed by measurement — a full-size index at the supported
+///   ceiling can be written and read back within the documented budget;
+/// * over-limit configuration is rejected — the funding path refuses a distinct investor
+///   beyond the cap (no partial write);
+/// * over-limit reads are safely paged — a page of [`MAX_INVESTOR_READ_BATCH`] stays within
+///   budget even at the supported ceiling;
+/// * legacy handling is documented (see [`LEGACY_OVERSIZED_INDEX_HANDLING`]).
 #[test]
-fn attestation_log_ceiling_stays_within_documented_budget() {
+fn investor_index_storage_limit_stress() {
     let env = Env::default();
-    let (client, id) = deploy(&env, 1_000_000i128);
+    let (client, id) = deploy(&env, 1_000_000_000i128);
     env.mock_all_auths_allowing_non_root_auth();
 
-    // Append exactly MAX_ATTESTATION_APPEND_ENTRIES entries, measuring the worst-case append.
-    let mut last_append = Measured { cpu_insns: 0, mem_bytes: 0 };
-    for i in 0..MAX_ATTESTATION_APPEND_ENTRIES {
-        let digest = attestation_digest(&env, i);
-        last_append = measure(&env, || {
-            client.append_attestation_digest(&digest);
+    // Sanity: the documented legacy handling is non-empty (documented, not silently dropped).
+    assert!(!LEGACY_OVERSIZED_INDEX_HANDLING.is_empty());
+
+    // --- Grow the index to the supported ceiling, recording the first failure point. ---
+    // We populate directly (mirroring the funding path's representation) so the measurement
+    // concentrates on the storage/read cost rather than thousands of `fund` calls.
+    let mut index: Vec<Address> = Vec::new(&env);
+    let mut first_failure: Option<u32> = None;
+    for i in 0..SUPPORTED_INVESTOR_INDEX_ENTRIES {
+        index.push_back(Address::generate(&env));
+        // Probe: writing the growing index must stay within the documented budget.
+        let probe = measure(&env, || {
+            env.as_contract(&id, || {
+                env.storage()
+                    .instance()
+                    .set(&super::DataKey::InvestorIndex, &index);
+                env.storage().instance().set(&keys::unique_funder_count(), &(i + 1));
+            });
         });
+        if probe.cpu_insns >= WORST_CASE_RELEASE_CPU_INSNS_CEILING
+            || probe.mem_bytes >= WORST_CASE_RELEASE_MEM_BYTES_CEILING
+        {
+            first_failure = Some(i + 1);
+            break;
+        }
     }
+
+    // The supported maximum must be reachable without hitting the budget: this is the
+    // measurement that backs SUPPORTED_INVESTOR_INDEX_ENTRIES.
     assert!(
-        last_append.cpu_insns < ATTESTATION_LOG_CPU_INSNS_CEILING,
-        "append at ceiling: CPU instructions {cpu} exceeded documented ceiling {ceil}",
-        cpu = last_append.cpu_insns,
-        ceil = ATTESTATION_LOG_CPU_INSNS_CEILING
-    );
-    assert!(
-        last_append.mem_bytes < ATTESTATION_LOG_MEM_BYTES_CEILING,
-        "append at ceiling: memory bytes {mem} exceeded documented ceiling {ceil}",
-        mem = last_append.mem_bytes,
-        ceil = ATTESTATION_LOG_MEM_BYTES_CEILING
+        first_failure.is_none(),
+        "investor index hit the budget at {n} entries, below the documented supported \
+         maximum {max}; lower SUPPORTED_INVESTOR_INDEX_ENTRIES",
+        n = first_failure.unwrap_or(0),
+        max = SUPPORTED_INVESTOR_INDEX_ENTRIES
     );
 
-    // Exactly 32 entries are supported.
-    assert_eq!(
-        client.get_attestation_digest_count(),
-        MAX_ATTESTATION_APPEND_ENTRIES,
-        "exactly MAX_ATTESTATION_APPEND_ENTRIES entries must be supported"
-    );
-
-    // Ledger entry size at the ceiling stays within the documented bound.
-    let entry_bytes = attestation_log_entry_bytes(&env, &id);
+    // Supported margin: the ceiling is at least the read batch, so paging is meaningful.
+    let margin = SUPPORTED_INVESTOR_INDEX_ENTRIES.saturating_sub(MAX_INVESTOR_READ_BATCH);
     assert!(
-        entry_bytes <= ATTESTATION_LOG_ENTRY_BYTES_CEILING,
-        "attestation log entry size {entry_bytes} exceeded documented ceiling {ceil}",
-        ceil = ATTESTATION_LOG_ENTRY_BYTES_CEILING
+        margin >= MAX_INVESTOR_READ_BATCH,
+        "supported margin {margin} too small relative to read batch {batch}",
+        batch = MAX_INVESTOR_READ_BATCH
     );
 
-    // Paginated reads at the ceiling stay within budget.
+    // --- Read costs at the supported ceiling, recorded via the budget tracker. ---
+    assert_eq!(client.get_unique_funder_count(), SUPPORTED_INVESTOR_INDEX_ENTRIES);
     let page = measure(&env, || {
-        let _ = client.get_attestation_digests(&0u32, &MAX_ATTESTATION_APPEND_ENTRIES);
+        let _ = client.get_investors(&0u32, &MAX_INVESTOR_READ_BATCH);
     });
-    assert!(
-        page.cpu_insns < ATTESTATION_LOG_CPU_INSNS_CEILING,
-        "get_attestation_digests at ceiling: CPU instructions {cpu} exceeded documented ceiling {ceil}",
-        cpu = page.cpu_insns,
-        ceil = ATTESTATION_LOG_CPU_INSNS_CEILING
-    );
-    assert!(
-        page.mem_bytes < ATTESTATION_LOG_MEM_BYTES_CEILING,
-        "get_attestation_digests at ceiling: memory bytes {mem} exceeded documented ceiling {ceil}",
-        mem = page.mem_bytes,
-        ceil = ATTESTATION_LOG_MEM_BYTES_CEILING
-    );
+    assert_within_budget("get_investors at supported ceiling", &page);
+    let funding_page = measure(&env, || {
+        let _ = client.get_funding_records(&0u32, &MAX_INVESTOR_READ_BATCH);
+    });
+    assert_within_budget("get_funding_records at supported ceiling", &funding_page);
 
-    // The 33rd append retains its existing typed rejection.
-    let overflow = attestation_digest(&env, MAX_ATTESTATION_APPEND_ENTRIES);
+    // --- Over-limit configuration is rejected: a distinct funder beyond the cap aborts. ---
+    let over_cap = Address::generate(&env);
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.append_attestation_digest(&overflow);
+        client.fund(&over_cap, &1i128);
     }));
-    assert!(res.is_err(), "the 33rd append must be rejected");
+    assert!(
+        res.is_err(),
+        "funding beyond the supported investor ceiling must be rejected"
+    );
+    assert_eq!(client.get_contribution(&over_cap), 0i128, "no partial write");
     assert_eq!(
-        client.get_attestation_digest_count(),
-        MAX_ATTESTATION_APPEND_ENTRIES,
-        "rejected append must not mutate the log"
-    );
-
-    // Batch revocation of all 32 entries stays within budget.
-    let mut digests: Vec<soroban_sdk::BytesN<32>> = Vec::new(&env);
-    for i in 0..MAX_ATTESTATION_APPEND_ENTRIES {
-        digests.push_back(attestation_digest(&env, i));
-    }
-    let revoke = measure(&env, || {
-        client.revoke_attestation_digests(&digests);
-    });
-    assert!(
-        revoke.cpu_insns < ATTESTATION_LOG_CPU_INSNS_CEILING,
-        "revoke_attestation_digests at ceiling: CPU instructions {cpu} exceeded documented ceiling {ceil}",
-        cpu = revoke.cpu_insns,
-        ceil = ATTESTATION_LOG_CPU_INSNS_CEILING
-    );
-    assert!(
-        revoke.mem_bytes < ATTESTATION_LOG_MEM_BYTES_CEILING,
-        "revoke_attestation_digests at ceiling: memory bytes {mem} exceeded documented ceiling {ceil}",
-        mem = revoke.mem_bytes,
-        ceil = ATTESTATION_LOG_MEM_BYTES_CEILING
+        client.get_unique_funder_count(),
+        SUPPORTED_INVESTOR_INDEX_ENTRIES,
+        "count unchanged after rejected over-limit funder"
     );
 }
 

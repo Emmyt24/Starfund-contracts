@@ -25,6 +25,7 @@ re-implementing storage reads to guarantee identical semantics.
 - [get_pending_admin](#get_pending_admin--optionaddress)
 - [get_pending_admin_expiry](#get_pending_admin_expiry--optionu64)
 - [get_pending_admin_remaining_secs](#get_pending_admin_remaining_secs--optionu64)
+- [get_pending_payer_recovery](#get_pending_payer_recovery--optionpendingpayerrecoveryview)
 - [get_legal_hold](#get_legal_hold--bool)
 - [get_legal_hold_clear_delay](#get_legal_hold_clear_delay--u64)
 - [get_legal_hold_clearable_at](#get_legal_hold_clearable_at--optionu64)
@@ -251,6 +252,37 @@ Returns the pending-admin proposal's remaining validity window computed against 
 - At `now == expiry`, this view returns `Some(0)` and `accept_admin` still accepts the proposal.
 - At `now > expiry`, this view still returns `Some(0)` and `accept_admin` rejects with `AdminProposalExpired`.
 - Pure read: no authorization, no storage writes, no TTL bump.
+
+### `get_pending_payer_recovery() → Option<PendingPayerRecoveryView>`
+
+**Storage keys:** `DataKey::PendingPayer`, `DataKey::PendingPayerExpiry`
+
+**Signature:** `pub fn get_pending_payer_recovery(env: Env) -> Option<PendingPayerRecoveryView>`
+
+Returns the active payer-recovery proposal — the pending replacement payer address and its
+expiry — in a single read, so clients can display the recovery target and timing without
+decoding storage directly.
+
+**Requires initialization:** No
+
+**Default when absent:** `None`
+
+**Return value:**
+- `Some(PendingPayerRecoveryView)` when a recovery proposal is pending, with fields:
+  - `pending_payer: Address` — the proposed replacement payer (from `DataKey::PendingPayer`).
+  - `expires_at: u64` — absolute ledger timestamp at which the proposal lapses (from `DataKey::PendingPayerExpiry`).
+- `None` when no proposal is pending.
+
+**Lifecycle (view transitions):**
+- `None` before any recovery proposal is made.
+- `Some(...)` after a proposal is recorded; a replacement proposal overwrites the view with the new payer and expiry.
+- `None` again after the proposal is accepted (acceptance clears both keys).
+- `None` again after the proposal is cancelled (cancellation clears both keys).
+
+The view reads the same `PendingPayer` / `PendingPayerExpiry` keys written by the recovery
+flow, so it can never drift from the stored proposal.
+
+**Pure read:** no authorization, no storage writes, no TTL bump.
 
 ---
 

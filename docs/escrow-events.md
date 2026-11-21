@@ -424,6 +424,26 @@ Emitted by `execute_callback` when a registered cross-contract callback is succe
 - `nonce` (u64): invocation nonce consumed by the callback.
 - `phase` (u32): lifecycle phase executed by the callback.
 
+### `CallbackCancelledEvent`
+Emitted by `cancel_callback` when an admin retires an obsolete pending callback registration.
+The pending index entry for the callback is removed; other registered callbacks are left unchanged.
+
+**Topics:**
+1. `cb_cncl` (Symbol)
+2. `invoice_id` (Symbol)
+3. `origin` (Address)
+
+**Data Payload:**
+- `nonce` (u64): invocation nonce of the cancelled callback.
+- `phase` (u32): lifecycle phase the cancelled callback was registered for.
+
+**Notes:**
+- Only the admin may cancel a callback; unauthorized callers are rejected.
+- After cancellation the callback can no longer execute: a later `execute_callback`
+  for the same `origin`/`phase`/`nonce` fails with the contract's callback-not-found error.
+- Cancellation is per-callback; other pending registrations remain active and executable.
+=======
+
 ---
 
 ## 🛠️ Indexing Recommendations

@@ -37,10 +37,17 @@
 
 | Requirement | Version / Notes |
 |---|---|
-| Stellar CLI | v22+ (`stellar --version`) |
-| Rust toolchain | stable, 1.70+ |
+| Stellar CLI | v22.x (tested baseline: v22.0.1) |
+| Rust toolchain | **1.85.1** (pinned by [`rust-toolchain.toml`](../rust-toolchain.toml)) |
 | `wasm32v1-none` target | `rustup target add wasm32v1-none` |
+| `soroban-sdk` | 25.0 (tested baseline with the CLI version above) |
 | Docker (optional) | for `stellar container start` standalone node |
+
+> **The repository toolchain file is authoritative.** [`rust-toolchain.toml`](../rust-toolchain.toml)
+> pins the compiler channel and the `wasm32v1-none` target. When you run `cargo` or `rustc`
+> inside this repository, `rustup` automatically selects the pinned toolchain — do **not**
+> install or override to a different stable version. If your shell reports a different
+> compiler, run `rustup show` in the repository root to confirm the override is active.
 
 Install the Stellar CLI:
 
@@ -48,12 +55,22 @@ Install the Stellar CLI:
 cargo install --locked stellar-cli --features opt
 ```
 
-Verify:
+Verify the toolchain and CLI after setup:
 
 ```bash
 stellar --version
-# stellar 22.x.x
+# stellar 22.0.1 (tested baseline)
+
+rustc --version
+# rustc 1.85.1 (pinned by rust-toolchain.toml)
+
+rustup show
+# confirms the active toolchain and installed wasm32v1-none target
 ```
+
+The CLI/SDK pairing above (Stellar CLI v22.x with `soroban-sdk` 25.0) is the combination
+exercised against this repository. Other versions may work, but flag names, XDR encoding, and
+SDK APIs can change between releases — re-verify the recipes if you deviate from the baseline.
 
 ---
 

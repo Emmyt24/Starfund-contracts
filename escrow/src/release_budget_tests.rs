@@ -29,8 +29,8 @@
 use soroban_sdk::{testutils::Address as _, Address, Env, String, Symbol, Vec};
 
 use super::{
-    keys, StarfundEscrow, StarfundEscrowClient, MAX_INVESTOR_READ_BATCH,
-    MAX_UNIQUE_INVESTORS, WORST_CASE_RELEASE_CPU_INSNS_CEILING,
+    keys, StarfundEscrow, StarfundEscrowClient, MAX_ATTESTATION_APPEND_ENTRIES,
+    MAX_INVESTOR_READ_BATCH, MAX_UNIQUE_INVESTORS, WORST_CASE_RELEASE_CPU_INSNS_CEILING,
     WORST_CASE_RELEASE_MEM_BYTES_CEILING,
 };
 

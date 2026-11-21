@@ -38,11 +38,6 @@ pub enum EscrowError {
     EscrowExpired = 32,
     EscrowNotExpired = 33,
     InvalidExpiry = 34,
-    RoleAddressConflict = 35,
-    NewSmeConflictsWithAdmin = 36,
-    NewSmeConflictsWithTreasury = 37,
-    NewSmeIsContractAddress = 38,
-    NewAdminConflictsWithSme = 39,
-    NewAdminConflictsWithTreasury = 40,
-    PendingAdminConflictsWithCurrentRole = 41,
+    CallbackOriginIsSelf = 35,
+    CallbackCancelled = 36,
 }

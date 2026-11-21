@@ -91,3 +91,80 @@ and token transfers) and the exact `EscrowError` variant at every call site. The
 predicates (`is_terminal_status`, `is_pre_settlement_status`) are deliberately
 separable from the `ensure`-side guards so that view helpers and tests can reuse
 the same status-set definition without hiding a panic.
+
+## Retry-safe admin nonce handling (issue #405)
+
+Administrative setters consume a shared, monotonically increasing admin nonce. A
+transaction that is *simulated* against nonce `N` is only valid if `N` is still the
+current nonce when it is *submitted*. Concurrent admin operations (or a retry after a
+dropped transaction) can invalidate a simulated nonce, so integrations must treat the
+nonce as a resource that is read, signed, and re-read on failure — never cached across
+attempts.
+
+### The nonce contract surface
+
+- `get_admin_nonce()` — read-only view returning the next nonce the contract will accept.
+- `consume_admin_nonce(env, expected)` — the internal guard invoked by every
+  nonce-consuming admin setter. It compares `expected` against the stored nonce and
+  either advances it (success) or rejects the call (stale/incorrect nonce). The nonce
+  is advanced **only** when the whole transaction commits; a rejected call leaves the
+  stored nonce untouched.
+
+The public setters that consume the admin nonce are:
+
+| Setter | Signature (argument order) |
+|---|---|
+| `update_funding_target` | `update_funding_target(env, admin, nonce, new_target)` |
+| `update_maturity` | `update_maturity(env, admin, nonce, new_maturity)` |
+| `set_legal_hold` | `set_legal_hold(env, admin, nonce, active)` |
+| `propose_admin` | `propose_admin(env, admin, nonce, new_admin)` |
+
+Each takes the `admin` address (which must `require_auth()`), the `nonce` the caller
+believes is current, and the setter-specific argument(s). The `nonce` argument is
+always the value returned by `get_admin_nonce()` at simulation time — never a value
+incremented locally from a previous attempt.
+
+### Recipe
+
+1. **Read the nonce.** Call `get_admin_nonce()` immediately before building the
+   transaction. Do not reuse a nonce read in an earlier attempt or from a cached
+   dashboard value.
+2. **Sign the exact arguments.** Build the invocation with the exact `admin`, `nonce`,
+   and setter arguments you intend to submit. Sign and submit that serialized payload
+   unchanged — do not re-serialize, re-order, or re-encode arguments between simulation
+   and submission, or the signed bytes will not match the simulated ones.
+3. **Classify the outcome.** A transaction is either:
+   - **Rejected** — the call failed (e.g. stale-nonce error, or any other `EscrowError`).
+     The nonce was **not** consumed; the stored nonce is unchanged. The operation did
+     not happen and is safe to retry after re-reading the nonce.
+   - **Committed** — the transaction succeeded and the nonce was consumed (advanced by
+     one). The operation happened; do **not** retry it. Any further admin call must
+     re-read `get_admin_nonce()` to obtain the new value.
+4. **Handle stale-nonce rejection.** If the rejection is specifically a stale/incorrect
+   nonce, another admin operation committed first and advanced the nonce. Do not
+   blindly resubmit the same payload — it will keep failing. Go back to step 1.
+5. **Re-simulate before retry.** After re-reading the nonce, re-run simulation with the
+   fresh nonce and the same setter arguments, then sign and submit the newly simulated
+   payload. Never patch the nonce into an already-signed transaction.
+
+### Concurrent admin operation example
+
+Two operators (or two automated jobs) both hold admin authority and both want to run
+an admin setter. Suppose the current nonce is `7`.
+
+1. Operator A reads `get_admin_nonce() == 7`, simulates
+   `update_funding_target(admin, 7, new_target)`, and submits it.
+2. Operator B also read `get_admin_nonce() == 7` earlier, simulates
+   `set_legal_hold(admin, 7, true)`, and submits it.
+3. A's transaction commits first: the nonce advances to `8`.
+4. B's transaction is **rejected** — its `nonce = 7` is now stale. B's nonce was not
+   consumed and `set_legal_hold` did not take effect.
+5. B re-reads `get_admin_nonce() == 8`, re-simulates
+   `set_legal_hold(admin, 8, true)`, signs the fresh payload, and submits. It commits
+   and the nonce advances to `9`.
+
+The same pattern applies when a single operator retries after a dropped transaction:
+if the original never committed, the nonce is unchanged and the retry with the same
+nonce succeeds; if it did commit, the retry is rejected as stale and must re-read the
+nonce before re-simulating. In both cases the rule is identical — **rejected means
+nonce intact and retryable; committed means nonce consumed and must be re-read.**

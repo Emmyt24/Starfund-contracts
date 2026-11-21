@@ -26,8 +26,10 @@
 12. [claim_investor_payout — Investor Claim](#12-claim_investor_payout--investor-claim)
 13. [Read-Only Getters](#13-read-only-getters)
 14. [Admin Operations](#14-admin-operations)
-15. [Auth Flags Reference](#15-auth-flags-reference)
-16. [Security Notes](#16-security-notes)
+15. [Cancellation and Refund Scenario (Local Only)](#15-cancellation-and-refund-scenario-local-only)
+16. [Dispute Resolution Scenario (Local Only)](#16-dispute-resolution-scenario-local-only)
+17. [Auth Flags Reference](#17-auth-flags-reference)
+18. [Security Notes](#18-security-notes)
 
 ---
 
@@ -876,7 +878,382 @@ stellar contract invoke \
 
 ---
 
-## 15. Auth Flags Reference
+## 15. Cancellation and Refund Scenario (Local Only)
+
+> **Local / standalone validator only.** This walkthrough uses throwaway simulation identities
+> created in [§3](#3-create-identities). No production secrets are required.
+>
+> **Compilation blockers:** The `cancel` and `refund` entrypoints referenced below must compile
+> on your checkout before this scenario can run. Resolve any outstanding build errors
+> (`cargo build --target wasm32v1-none --release`) first, then redeploy the WASM per [§5](#5-deploy-the-contract).
+
+This scenario demonstrates the alternative investor recovery path: an escrow that is only
+**partially funded** is cancelled by an authorized party, then each investor is refunded their
+principal. It verifies that investor token balances are restored and shows the post-refund
+liability state.
+
+### 15.1 Set up a fresh escrow
+
+Reuse the identities from [§3](#3-create-identities) and the token from [§6](#6-deploy-a-test-token).
+Deploy a second contract instance so the earlier walkthrough state is untouched:
+
+```bash
+REFUND_CONTRACT_ID=$(stellar contract deploy \
+  --wasm target/wasm32v1-none/release/starfund_escrow.wasm \
+  --source admin \
+  --network local)
+
+echo "REFUND_CONTRACT_ID: $REFUND_CONTRACT_ID"
+
+stellar contract invoke \
+  --id "$REFUND_CONTRACT_ID" \
+  --source admin \
+  --network local \
+  -- init \
+  --admin "$ADMIN" \
+  --invoice_id "INVREFUND" \
+  --sme_address "$SME" \
+  --amount 10000_0000000 \
+  --yield_bps 800 \
+  --maturity 0 \
+  --funding_token "$TOKEN_ID" \
+  --registry null \
+  --treasury "$TREASURY" \
+  --yield_tiers null \
+  --min_contribution null \
+  --max_unique_investors null
+```
+
+### 15.2 Record pre-funding token balances
+
+```bash
+INV1_BEFORE=$(stellar contract invoke \
+  --id "$TOKEN_ID" --network local \
+  -- balance --id "$INVESTOR1")
+
+INV2_BEFORE=$(stellar contract invoke \
+  --id "$TOKEN_ID" --network local \
+  -- balance --id "$INVESTOR2")
+
+echo "investor1 before: $INV1_BEFORE"
+echo "investor2 before: $INV2_BEFORE"
+```
+
+### 15.3 Partially fund the escrow
+
+Fund only part of the target so the escrow stays in status `0` (open):
+
+```bash
+# Investor 1 funds 3000 units
+stellar contract invoke \
+  --id "$REFUND_CONTRACT_ID" \
+  --source investor1 \
+  --network local \
+  -- fund \
+  --investor "$INVESTOR1" \
+  --amount 3000_0000000
+
+# Investor 2 funds 2000 units — total 5000 of 10000 target, still open
+stellar contract invoke \
+  --id "$REFUND_CONTRACT_ID" \
+  --source investor2 \
+  --network local \
+  -- fund \
+  --investor "$INVESTOR2" \
+  --amount 2000_0000000
+```
+
+Confirm the escrow is still open and partially funded:
+
+```bash
+stellar contract invoke \
+  --id "$REFUND_CONTRACT_ID" \
+  --network local \
+  -- get_escrow
+```
+
+Expected: `"funded_amount": "5000_0000000"`, `"status": "0"`.
+
+### 15.4 Cancel the escrow
+
+The authorized party (admin, per the `cancel` entrypoint's `require_auth()` in
+[`escrow/src/lib.rs`](../escrow/src/lib.rs)) cancels the open escrow:
+
+```bash
+stellar contract invoke \
+  --id "$REFUND_CONTRACT_ID" \
+  --source admin \
+  --network local \
+  -- cancel
+```
+
+Confirm the cancelled status:
+
+```bash
+stellar contract invoke \
+  --id "$REFUND_CONTRACT_ID" \
+  --network local \
+  -- get_escrow
+```
+
+Expected: `"status"` reflects the cancelled state (see the status table in
+[§18](#18-security-notes)). `settle` and `withdraw` are now rejected.
+
+### 15.5 Refund each investor
+
+```bash
+stellar contract invoke \
+  --id "$REFUND_CONTRACT_ID" \
+  --source investor1 \
+  --network local \
+  -- refund \
+  --investor "$INVESTOR1"
+
+stellar contract invoke \
+  --id "$REFUND_CONTRACT_ID" \
+  --source investor2 \
+  --network local \
+  -- refund \
+  --investor "$INVESTOR2"
+```
+
+### 15.6 Reconciliation checks
+
+**Investor token recovery** — compare post-refund balances to the pre-funding snapshot:
+
+```bash
+INV1_AFTER=$(stellar contract invoke \
+  --id "$TOKEN_ID" --network local \
+  -- balance --id "$INVESTOR1")
+
+INV2_AFTER=$(stellar contract invoke \
+  --id "$TOKEN_ID" --network local \
+  -- balance --id "$INVESTOR2")
+
+echo "investor1 after: $INV1_AFTER (expected == $INV1_BEFORE)"
+echo "investor2 after: $INV2_AFTER (expected == $INV2_BEFORE)"
+```
+
+Both balances should equal their pre-funding values, confirming full principal recovery.
+
+**Per-investor contribution** — refunded principal should be zeroed out:
+
+```bash
+stellar contract invoke \
+  --id "$REFUND_CONTRACT_ID" \
+  --network local \
+  -- get_contribution \
+  --investor "$INVESTOR1"
+
+stellar contract invoke \
+  --id "$REFUND_CONTRACT_ID" \
+  --network local \
+  -- get_contribution \
+  --investor "$INVESTOR2"
+```
+
+Expected: `"0"` for each investor after refund.
+
+**Distributed principal** — the running total of refunded principal:
+
+```bash
+stellar contract invoke \
+  --id "$REFUND_CONTRACT_ID" \
+  --network local \
+  -- get_distributed_principal
+```
+
+Expected: `"5000_0000000"` (the sum of both refunds).
+
+**Post-refund liabilities** — read the escrow state to confirm no outstanding principal remains:
+
+```bash
+stellar contract invoke \
+  --id "$REFUND_CONTRACT_ID" \
+  --network local \
+  -- get_escrow
+```
+
+Expected: `"funded_amount": "0"` (or the residual liability field the contract exposes) and a
+terminal cancelled status. Any non-zero residual indicates a reconciliation failure.
+
+**Events** — confirm the cancellation and refund events were emitted:
+
+```bash
+stellar events --id "$REFUND_CONTRACT_ID" --network local
+```
+
+Look for the cancellation event and one refund event per investor.
+
+---
+
+## 16. Dispute Resolution Scenario (Local Only)
+
+> **Local / standalone validator only.** Uses the simulation identities from
+> [§3](#3-create-identities); no production secrets are required.
+>
+> **Compilation blockers:** The `open_dispute` and `close_dispute` entrypoints must compile on
+> your checkout before this scenario can run. Resolve outstanding build errors and redeploy the
+> WASM per [§5](#5-deploy-the-contract) first.
+
+This scenario demonstrates opening a dispute, observing a blocked operation (with balances
+unchanged), then resolving the dispute and re-running the operation successfully.
+
+### 16.1 Set up a funded escrow
+
+```bash
+DISPUTE_CONTRACT_ID=$(stellar contract deploy \
+  --wasm target/wasm32v1-none/release/starfund_escrow.wasm \
+  --source admin \
+  --network local)
+
+echo "DISPUTE_CONTRACT_ID: $DISPUTE_CONTRACT_ID"
+
+stellar contract invoke \
+  --id "$DISPUTE_CONTRACT_ID" \
+  --source admin \
+  --network local \
+  -- init \
+  --admin "$ADMIN" \
+  --invoice_id "INVDISPUTE" \
+  --sme_address "$SME" \
+  --amount 10000_0000000 \
+  --yield_bps 800 \
+  --maturity 0 \
+  --funding_token "$TOKEN_ID" \
+  --registry null \
+  --treasury "$TREASURY" \
+  --yield_tiers null \
+  --min_contribution null \
+  --max_unique_investors null
+
+# Fully fund so the escrow reaches status 1 (funded)
+stellar contract invoke \
+  --id "$DISPUTE_CONTRACT_ID" \
+  --source investor1 \
+  --network local \
+  -- fund \
+  --investor "$INVESTOR1" \
+  --amount 10000_0000000
+```
+
+### 16.2 Open the dispute
+
+The `open_dispute` entrypoint takes a signer address and a nonce. Use the exact argument names
+from the current signature in [`escrow/src/lib.rs`](../escrow/src/lib.rs):
+
+```bash
+# Signer is the admin identity; nonce is a caller-chosen unique value
+stellar contract invoke \
+  --id "$DISPUTE_CONTRACT_ID" \
+  --source admin \
+  --network local \
+  -- open_dispute \
+  --signer "$ADMIN" \
+  --nonce 1
+```
+
+Confirm the dispute record:
+
+```bash
+stellar contract invoke \
+  --id "$DISPUTE_CONTRACT_ID" \
+  --network local \
+  -- get_dispute
+```
+
+Expected: a record showing the dispute is open, with `signer` = `$ADMIN` and `nonce` = `1`.
+
+### 16.3 Attempt a blocked operation
+
+While the dispute is open, `settle` is blocked. Capture balances before the attempt:
+
+```bash
+SME_BEFORE=$(stellar contract invoke \
+  --id "$TOKEN_ID" --network local \
+  -- balance --id "$SME")
+
+# This should fail (panic) because the dispute is open
+stellar contract invoke \
+  --id "$DISPUTE_CONTRACT_ID" \
+  --source sme \
+  --network local \
+  -- settle
+```
+
+The call panics with the dispute-active error. Confirm balances are unchanged:
+
+```bash
+SME_AFTER=$(stellar contract invoke \
+  --id "$TOKEN_ID" --network local \
+  -- balance --id "$SME")
+
+echo "sme before: $SME_BEFORE"
+echo "sme after:  $SME_AFTER (expected == $SME_BEFORE)"
+```
+
+Also confirm the escrow status is still `1` (funded) — the blocked `settle` did not advance it:
+
+```bash
+stellar contract invoke \
+  --id "$DISPUTE_CONTRACT_ID" \
+  --network local \
+  -- get_escrow
+```
+
+### 16.4 Close the dispute
+
+Use the exact `close_dispute` arguments from the current signature:
+
+```bash
+stellar contract invoke \
+  --id "$DISPUTE_CONTRACT_ID" \
+  --source admin \
+  --network local \
+  -- close_dispute \
+  --signer "$ADMIN" \
+  --nonce 1
+```
+
+Confirm the dispute record now shows the dispute resolved:
+
+```bash
+stellar contract invoke \
+  --id "$DISPUTE_CONTRACT_ID" \
+  --network local \
+  -- get_dispute
+```
+
+### 16.5 Re-run the previously blocked operation
+
+```bash
+stellar contract invoke \
+  --id "$DISPUTE_CONTRACT_ID" \
+  --source sme \
+  --network local \
+  -- settle
+```
+
+Expected: succeeds, and `get_escrow` now reports `"status": "2"` (settled). The intended
+operation is restored after resolution.
+
+### 16.6 Compare dispute record and events
+
+```bash
+stellar contract invoke \
+  --id "$DISPUTE_CONTRACT_ID" \
+  --network local \
+  -- get_dispute
+
+stellar events --id "$DISPUTE_CONTRACT_ID" --network local
+```
+
+Compare the `get_dispute` record before and after resolution (open → closed) and confirm the
+event log contains a dispute-opened event, a dispute-closed event, and the settlement event.
+
+---
+
+## 17. Auth Flags Reference
 
 ### How `require_auth()` maps to CLI flags
 
@@ -903,6 +1280,10 @@ for that address. For the common case where `--source` is the authorizing addres
 | `update_funding_target` | `admin` | `admin` |
 | `migrate` | none (panics; no path implemented) | `admin` (by convention) |
 | `record_sme_collateral_commitment` | `sme_address` | `sme` |
+| `cancel` | `admin` | `admin` |
+| `refund` | `investor` | `investor1` / `investor2` |
+| `open_dispute` | `signer` | `admin` |
+| `close_dispute` | `signer` | `admin` |
 
 ### Multi-party authorization (`--auth`)
 
@@ -925,7 +1306,7 @@ For local simulation, using `--source <identity>` where the identity matches the
 
 ---
 
-## 16. Security Notes
+## 18. Security Notes
 
 ### Maintainer secrets
 
@@ -963,13 +1344,15 @@ tokens are **explicitly out of scope** and will cause a panic on balance asserti
 
 | Status | Value | Allowed next transitions |
 |---|---|---|
-| Open | `0` | → `1` (funded, via `fund`) |
+| Open | `0` | → `1` (funded, via `fund`) or cancelled (via `cancel`) |
 | Funded | `1` | → `2` (settled, via `settle`) or `3` (withdrawn, via `withdraw`) |
 | Settled | `2` | terminal — `claim_investor_payout`, `sweep_terminal_dust` only |
 | Withdrawn | `3` | terminal — `sweep_terminal_dust` only |
+| Cancelled | `4` | terminal — `refund` per investor, `sweep_terminal_dust` only |
 
 Transitions are forward-only. Legal hold blocks `settle`, `withdraw`, `claim_investor_payout`,
-`fund` (new funding), and `sweep_terminal_dust`.
+`fund` (new funding), and `sweep_terminal_dust`. An open dispute blocks `settle` until
+`close_dispute` is called.
 
 ### Investor cap
 

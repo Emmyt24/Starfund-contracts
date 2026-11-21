@@ -10511,6 +10511,25 @@ impl StarfundEscrow {
     /// Allocates the next monotonic invocation nonce, stores the [`CallbackContext`] in instance
     /// storage, and emits [`CallbackRegisteredEvent`].
     ///
+    /// # Supported origin address kinds
+    ///
+    /// `origin` must be an **external** contract address (or an account address acting as a
+    /// cross-contract caller). The escrow's own address
+    /// ([`Env::current_contract_address`]) is **not** a supported origin: there is no external
+    /// authorization workflow for a self-origin callback, so such registrations would only create
+    /// unusable pending state. Self-origin registration is rejected with
+    /// [`EscrowError::CallbackOriginIsSelf`] **before** any nonce is allocated.
+    ///
+    /// # Lifetime policy
+    ///
+    /// Registrations are **valid indefinitely** once created: there is no implicit expiry and
+    /// [`CallbackContext::created_at`] is informational only (it is never used to reject
+    /// execution). A pending callback remains executable until it is consumed by
+    /// [`StarfundEscrow::execute_callback`], retired by the admin via
+    /// [`StarfundEscrow::cancel_callback`], or cleared wholesale when the escrow is cancelled
+    /// ([`StarfundEscrow::cancel_funding`]). Operators who need bounded outstanding
+    /// authorizations should cancel obsolete registrations explicitly.
+    ///
     /// # Authorization
     /// Requires the signature of the current [`InvoiceEscrow::admin`].
     ///
@@ -10518,6 +10537,7 @@ impl StarfundEscrow {
     /// - [`EscrowError::EscrowNotInitialized`] if escrow storage is missing.
     /// - [`EscrowError::CallbackOnTerminalEscrow`] if the escrow is not in an active lifecycle
     ///   state (only Open = 0 or Funded = 1 are permitted).
+    /// - [`EscrowError::CallbackOriginIsSelf`] if `origin` is this contract's own address.
     ///
     /// # Returns
     /// The allocated unique invocation nonce (`u64`).
@@ -10557,6 +10577,62 @@ impl StarfundEscrow {
     /// Implementation lives in [`crate::callback`] (issue #388).
     pub fn execute_callback(env: Env, nonce: u64, origin: Address, phase: u32) -> CallbackContext {
         crate::callback::execute_callback(&env, nonce, origin, phase)
+    }
+
+    /// Cancel a pending callback registration (admin-only retirement of obsolete callbacks).
+    ///
+    /// Removes the pending index entry for the callback matching `origin` and `phase`, deletes
+    /// its [`CallbackContext`], and emits [`CallbackCancelledEvent`]. Other pending callbacks are
+    /// left untouched. After cancellation, [`StarfundEscrow::execute_callback`] for the retired
+    /// nonce fails with [`EscrowError::CallbackCancelled`].
+    ///
+    /// # Authorization
+    /// Requires the signature of the current [`InvoiceEscrow::admin`].
+    ///
+    /// # Errors
+    /// - [`EscrowError::EscrowNotInitialized`] if escrow storage is missing.
+    /// - [`EscrowError::CallbackNotFound`] if no pending callback matches `origin` and `phase`.
+    ///
+    /// # Returns
+    /// The cancelled invocation nonce (`u64`).
+    pub fn cancel_callback(env: Env, origin: Address, phase: u32) -> u64 {
+        let escrow = Self::load_escrow_require_admin(&env);
+
+        let pending = Self::pending_callback_nonces(&env);
+        let mut cancelled: Option<u64> = None;
+        let mut index = 0;
+        while index < pending.len() {
+            let nonce = pending.get(index).unwrap();
+            let context: Option<CallbackContext> = env
+                .storage()
+                .instance()
+                .get(&DataKey::CallbackContext(nonce));
+            if let Some(context) = context {
+                if !context.consumed && context.origin == origin && context.phase == phase {
+                    cancelled = Some(nonce);
+                    break;
+                }
+            }
+            index += 1;
+        }
+
+        let nonce = cancelled.unwrap_or_else(|| fail(&env, EscrowError::CallbackNotFound));
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::CallbackContext(nonce));
+        Self::remove_pending_callback_nonce(&env, nonce);
+
+        CallbackCancelledEvent {
+            name: symbol_short!("cb_can"),
+            invoice_id: escrow.invoice_id,
+            origin,
+            nonce,
+            phase,
+        }
+        .publish(&env);
+
+        nonce
     }
 
     /// Read-only view returning the registered callback context for a given invocation `nonce`.
@@ -10599,6 +10675,26 @@ impl StarfundEscrow {
         crate::callback::get_callback_nonce(&env)
     }
 
+    /// Read-only view of the active payer recovery proposal.
+    ///
+    /// Returns `None` when no proposal is pending. When a proposal exists, the returned
+    /// [`PayerRecoveryProposalView`] mirrors [`DataKey::PendingPayer`] and
+    /// [`DataKey::PendingPayerExpiry`]. The view clears (returns `None`) once the proposal is
+    /// accepted via [`StarfundEscrow::accept_payer_recovery`], cancelled via
+    /// [`StarfundEscrow::cancel_pending_payer`], or replaced by a new proposal.
+    pub fn get_pending_payer_recovery(env: Env) -> Option<PayerRecoveryProposalView> {
+        let pending: Option<Address> = env.storage().instance().get(&DataKey::PendingPayer);
+        let pending = pending?;
+        let expiry: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingPayerExpiry);
+        Some(PayerRecoveryProposalView {
+            pending_payer: pending,
+            expiry,
+        })
+    }
+
     /// Read-only view returning whether the callback for `nonce` has been consumed.
     /// Returns `false` if the callback is unconsumed or does not exist.
     pub fn is_callback_consumed(env: Env, nonce: u64) -> bool {
@@ -10636,6 +10732,17 @@ pub enum InvestorKeyState {
     UnknownArchival,
     /// The key is absent **and** ledger evidence confirms archival/expiry.
     ConfirmedExpired,
+}
+
+/// Read-only view of the active payer recovery proposal returned by
+/// [`StarfundEscrow::get_pending_payer_recovery`].
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PayerRecoveryProposalView {
+    /// The proposed successor payer awaiting acceptance.
+    pub pending_payer: Address,
+    /// Ledger timestamp (seconds) at which the proposal expires, if one was recorded.
+    pub expiry: Option<u64>,
 }
 
 /// Read-only reconciliation snapshot returned by

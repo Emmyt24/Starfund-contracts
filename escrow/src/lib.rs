@@ -9580,6 +9580,10 @@ impl StarfundEscrow {
             EscrowError::ProposedAdminIsContractAddress,
         );
 
+        // Preserve the init-time role separation: the nominee must not collide with
+        // the current SME or treasury (issue #430).
+        Self::ensure_admin_candidate_distinct_from_roles(&env, &escrow, &new_admin);
+
         let previous_pending: Option<Address> =
             env.storage().instance().get(&DataKey::PendingAdmin);
         if let Some(pending) = previous_pending {
@@ -9659,6 +9663,11 @@ impl StarfundEscrow {
         pending.require_auth();
 
         let mut escrow = Self::get_escrow(env.clone());
+
+        // Recheck the role separation policy at acceptance time: SME and treasury may
+        // have changed since the proposal was created (issue #430).
+        Self::ensure_admin_candidate_distinct_from_roles(&env, &escrow, &pending);
+
         let prior_admin = escrow.admin.clone();
         escrow.admin = pending.clone();
 
@@ -9795,9 +9804,6 @@ impl StarfundEscrow {
             EscrowError::RecoverAdminReasonTooLong,
         );
 
-        // Consume admin nonce for replay protection.
-        Self::consume_admin_nonce(&env, expected_nonce);
-
         let pending: Option<Address> = env.storage().instance().get(&DataKey::PendingAdmin);
         ensure(&env, pending.is_some(), EscrowError::NoPendingAdmin);
         let pending = pending.unwrap();
@@ -9810,6 +9816,14 @@ impl StarfundEscrow {
         let now = env.ledger().timestamp();
         ensure(&env, now > expiry, EscrowError::AdminRecoveryNotExpired);
 
+        // Issue #431: expired-proposal cleanup is permissionless and must NOT consume the
+        // shared administrative nonce. Consuming it here would let an unrelated caller
+        // invalidate an already-prepared authenticated admin invocation. Replay protection
+        // for this entrypoint is provided by the one-shot removal of the pending proposal
+        // below (a repeated call fails with `NoPendingAdmin`). `expected_nonce` is retained
+        // for ABI compatibility but is intentionally not consumed.
+        let _ = expected_nonce;
+
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.storage()
             .instance()
@@ -9821,6 +9835,16 @@ impl StarfundEscrow {
             current_admin: escrow.admin,
             abandoned_pending: pending.clone(),
             reason,
+        }
+        .publish(&env);
+
+        // Emit an explicit cleanup-authority event so indexers can distinguish
+        // permissionless expired-proposal cleanup from authenticated admin actions.
+        AdminProposalCleanedUp {
+            name: symbol_short!("adm_cln"),
+            invoice_id: escrow.invoice_id,
+            cleaned_pending: pending.clone(),
+            permissionless: true,
         }
         .publish(&env);
 
@@ -10607,6 +10631,80 @@ impl StarfundEscrow {
         context.map(|c| c.consumed).unwrap_or(false)
     }
 
+    /// Shared role-address policy (issue #430).
+    ///
+    /// Enforces the init-time separation policy for the three privileged roles:
+    /// `admin`, `sme_address` and `treasury` must be pairwise distinct, and the escrow
+    /// contract address itself must not occupy the SME (beneficiary) or treasury role.
+    ///
+    /// # Errors
+    /// - [`EscrowError::AdminSmeSameAddress`] if `admin == sme_address`.
+    /// - [`EscrowError::AdminTreasurySameAddress`] if `admin == treasury`.
+    /// - [`EscrowError::SmeTreasurySameAddress`] if `sme_address == treasury`.
+    /// - [`EscrowError::SmeIsContractAddress`] if `sme_address` is the escrow contract.
+    /// - [`EscrowError::TreasuryIsContractAddress`] if `treasury` is the escrow contract.
+    fn validate_role_addresses(
+        env: &Env,
+        admin: &Address,
+        sme_address: &Address,
+        treasury: &Address,
+    ) {
+        ensure(
+            env,
+            admin != sme_address,
+            EscrowError::AdminSmeSameAddress,
+        );
+        ensure(
+            env,
+            admin != treasury,
+            EscrowError::AdminTreasurySameAddress,
+        );
+        ensure(
+            env,
+            sme_address != treasury,
+            EscrowError::SmeTreasurySameAddress,
+        );
+
+        let contract_address = Address::from_contract_id(env);
+        ensure(
+            env,
+            sme_address != &contract_address,
+            EscrowError::SmeIsContractAddress,
+        );
+        ensure(
+            env,
+            treasury != &contract_address,
+            EscrowError::TreasuryIsContractAddress,
+        );
+    }
+
+    /// Reject an admin candidate that collides with the current SME or treasury role.
+    ///
+    /// Used by [`StarfundEscrow::propose_admin`] and re-checked by
+    /// [`StarfundEscrow::accept_admin`] because roles may change after nomination.
+    fn ensure_admin_candidate_distinct_from_roles(
+        env: &Env,
+        escrow: &InvoiceEscrow,
+        candidate: &Address,
+    ) {
+        ensure(
+            env,
+            candidate != &escrow.sme_address,
+            EscrowError::AdminSmeSameAddress,
+        );
+
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .unwrap_or_else(|| fail(env, EscrowError::TreasuryNotSet));
+        ensure(
+            env,
+            candidate != &treasury,
+            EscrowError::AdminTreasurySameAddress,
+        );
+    }
+
     fn pending_callback_nonces(env: &Env) -> Vec<u64> {
         if let Some(pending) = env
             .storage()
@@ -10648,6 +10746,27 @@ impl StarfundEscrow {
             .instance()
             .set(&DataKey::PendingCallbackNonces, &pending);
     }
+}
+
+/// Read-only reconciliation snapshot returned by
+/// [`StarfundEscrow::get_reconciliation`].
+///
+/// Derive rationale:
+/// - `Debug`: improves failure diagnostics in tests.
+/// - `PartialEq`: allows exact assertions in tests.
+/// Emitted by [`StarfundEscrow::recover_admin`] to describe the cleanup authority.
+///
+/// `permissionless == true` means an expired pending-admin proposal was garbage-collected
+/// without consuming the administrative nonce (issue #431); this is not an authenticated
+/// admin action.
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdminProposalCleanedUp {
+    #[topic]
+    pub name: Symbol,
+    pub invoice_id: Symbol,
+    pub cleaned_pending: Address,
+    pub permissionless: bool,
 }
 
 /// Read-only reconciliation snapshot returned by

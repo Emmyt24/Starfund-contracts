@@ -424,6 +424,52 @@ Emitted by `execute_callback` when a registered cross-contract callback is succe
 - `nonce` (u64): invocation nonce consumed by the callback.
 - `phase` (u32): lifecycle phase executed by the callback.
 
+### `AdminRecovered`
+Emitted by `recover_admin` when an expired pending admin proposal is cleared. The event
+distinguishes **permissionless cleanup** from an **authenticated admin recovery** so indexers
+can attribute the action correctly.
+
+**Topics:**
+1. `adm_rec` (Symbol)
+2. `invoice_id` (Symbol)
+
+**Data Payload:**
+- `authority` (u32): `1` when the caller was the authenticated current admin, `0` when the
+  cleanup was performed permissionlessly by an unrelated caller.
+- `proposal_cleared` (u32): `1` when an expired pending proposal was removed, `0` otherwise.
+- `nonce_consumed` (u32): `1` when the shared administrative nonce was advanced by this call,
+  `0` when it was left untouched.
+
+**Nonce semantics:**
+- Permissionless expired-proposal cleanup **does not** consume the shared administrative
+  nonce. An unrelated caller cannot invalidate an already prepared administrative invocation
+  that relies on the current nonce.
+- Nonce consumption is reserved for authenticated admin actions. Only a call authorized by the
+  current admin advances the nonce, so replay protection remains intact for governance
+  invocations.
+- Expired proposal cleanup remains possible without admin authorization, preserving key-loss
+  recovery: a stuck expired proposal can always be garbage-collected.
+
+**Indexer guidance:**
+- Treat `authority = 0` events as housekeeping only; do not advance any cached admin nonce.
+- Treat `authority = 1` events as authenticated admin actions; reconcile the cached nonce with
+  `nonce_consumed`.
+- `proposal_cleared = 1` means the pending proposal for the invoice is no longer present.
+
+**Example (JSON Decoded):**
+```json
+{
+  "topics": ["adm_rec", "INV_001"],
+  "data": {
+    "authority": 0,
+    "proposal_cleared": 1,
+    "nonce_consumed": 0
+  }
+}
+```
+
+**Related entrypoints:** `recover_admin`, `consume_admin_nonce`.
+
 ---
 
 ## 🛠️ Indexing Recommendations

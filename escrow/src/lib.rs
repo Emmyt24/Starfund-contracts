@@ -144,9 +144,21 @@
 //!
 //! ## Funding-close snapshot (pro-rata)
 //!
-//! When status first becomes **funded**, [`DataKey::FundingCloseSnapshot`] stores total principal
-//! (including over-funding past target), the target, and ledger timestamp/sequence. **Immutable** once
-//! written; see `docs/escrow-pro-rata.md` for the authoritative pro-rata payout math and rounding rules.
+//! [`DataKey::FundingCloseSnapshot`] is written by **exactly four** production paths. Every writer
+//! records the same shape (total principal including over-funding past target, the target in force
+//! at close, and ledger timestamp/sequence) and the snapshot is **immutable** once written:
+//!
+//! | Writer | Trigger | Recorded `target` | Recorded `total_principal` |
+//! |--------|---------|-------------------|----------------------------|
+//! | [`StarfundEscrow::fund`] | deposit crosses the target (status `0` ΓåÆ `1`) | current `funding_target` | `funded_amount` after the deposit |
+//! | [`StarfundEscrow::fund_with_commitment`] | first deposit crosses the target | current `funding_target` | `funded_amount` after the deposit |
+//! | [`StarfundEscrow::partial_settle`] | admin closes funding early (status `0` ΓåÆ `1`) | current `funding_target` | `funded_amount` at close (must be `> 0`) |
+//! | [`StarfundEscrow::update_funding_target`] | admin lowers the target to or below `funded_amount` | the **new** (lowered) target | `funded_amount` at close |
+//!
+//! The first two are **deposit closes** (a threshold-crossing deposit); the last two are
+//! **administrative closes** that produce a snapshot without any new deposit. Auditors must not
+//! assume a snapshot implies a deposit event. See `docs/escrow-snapshot.md` for the lifecycle and
+//! `docs/escrow-pro-rata.md` for the authoritative pro-rata payout math and rounding rules.
 //! Off-chain share for an investor is `get_contribution(addr) / snapshot.total_principal`.
 //!
 //! ## Immutable protocol fee (SME disbursement split)
@@ -10733,6 +10745,22 @@ impl StarfundEscrow {
 
     /// Read-only view returning the registered callback context for a given invocation `nonce`.
     /// Returns `None` if no callback was registered with this nonce.
+    ///
+    /// # Paginated reads are not snapshot-isolated
+    ///
+    /// Offset-based paginated getters (for example [`StarfundEscrow::get_investors`]) read the
+    /// live index on every call and carry **no snapshot token**. If the index mutates between
+    /// two page reads ΓÇö an allowlist removal, an `unfund`, or a new investor ΓÇö later offsets
+    /// shift and a naive scan can **skip or repeat** entries. Clients must either:
+    ///
+    /// 1. pin every page read to a single ledger (simulate all pages against the same ledger
+    ///    sequence when the RPC supports ledger-pinned simulation), or
+    /// 2. reconcile across ledgers: record the ledger sequence of each page, and if it changes
+    ///    mid-scan, discard the scan and retry from offset `0` (bounded retries).
+    ///
+    /// Example: investors `[A, B, C]` are read with `limit = 2` ΓåÆ page 1 `[A, B]`. If `A` is
+    /// removed before page 2, the index becomes `[B, C]` and offset `2` returns `[]`, silently
+    /// dropping `C`. Retrying the whole scan after the mutation yields `[B, C]`.
     pub fn get_callback(env: Env, nonce: u64) -> Option<CallbackContext> {
         crate::callback::get_callback(&env, nonce)
     }
@@ -10767,6 +10795,9 @@ impl StarfundEscrow {
 
     /// Read-only view returning the current callback invocation nonce counter.
     /// Returns `0` if no callbacks have been registered.
+    ///
+    /// See [`StarfundEscrow::get_callback`] for the paginated-read consistency contract that
+    /// applies to all offset-based getters.
     pub fn get_callback_nonce(env: Env) -> u64 {
         crate::callback::get_callback_nonce(&env)
     }
@@ -10793,6 +10824,9 @@ impl StarfundEscrow {
 
     /// Read-only view returning whether the callback for `nonce` has been consumed.
     /// Returns `false` if the callback is unconsumed or does not exist.
+    ///
+    /// See [`StarfundEscrow::get_callback`] for the paginated-read consistency contract that
+    /// applies to all offset-based getters.
     pub fn is_callback_consumed(env: Env, nonce: u64) -> bool {
         crate::callback::is_callback_consumed(&env, nonce)
     }

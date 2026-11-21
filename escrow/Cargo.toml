@@ -20,6 +20,7 @@ crate-type = ["cdylib", "rlib"]
 #   not make production code paths depend on testutils-gated APIs.
 [features]
 testutils = ["soroban-sdk/testutils"]
+fixtures = ["testutils"]
 
 [dependencies]
 soroban-sdk = "25.0"

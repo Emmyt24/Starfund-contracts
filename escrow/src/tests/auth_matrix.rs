@@ -12,6 +12,7 @@
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, MockAuth, MockAuthInvoke},
+    token::{Client as TokenClient, StellarAssetClient},
     Address, BytesN, Env, IntoVal, String as SorobanString, Vec as SorobanVec,
 };
 
@@ -149,6 +150,190 @@ fn setup_settled(
     let (client, admin, sme, investor, treasury) = setup_funded(env);
     client.settle();
     (client, admin, sme, investor, treasury)
+}
+
+// ── contract-wallet funding authorization (#400) ────────────────────────
+
+/// Deploy a real Stellar asset contract and a minimal escrow that uses it as
+/// the funding token. Returns `(client, admin, sme, treasury, token)`.
+///
+/// Unlike `setup_inited`, the token is a real SAC so the nested token-transfer
+/// authorization path is exercised. `mock_all_auths` is enabled only for
+/// `init`; callers are expected to install explicit `mock_auths` before
+/// invoking `fund`.
+fn setup_inited_with_sac(
+    env: &Env,
+) -> (
+    crate::StarfundEscrowClient<'_>,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
+    env.mock_all_auths();
+    let client = deploy(env);
+    let admin = Address::generate(env);
+    let sme = Address::generate(env);
+    let treasury = Address::generate(env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let token = sac.address();
+    client.init(
+        &admin,
+        &SorobanString::from_str(env, "INV_CW"),
+        &sme,
+        &1_000i128,
+        &500i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+    (client, admin, sme, treasury, token)
+}
+
+/// A minimal contract-wallet fixture.
+///
+/// The wallet is represented by a registered contract address. It holds a
+/// token balance and authorizes funding through a single explicit auth entry
+/// that covers both the escrow `fund` invocation and the nested token
+/// `transfer` sub-invocation. No `__check_auth` is implemented: the fixture
+/// models the wallet's authorization surface via `MockAuth` entries so the
+/// host still validates the full invocation tree (contract → token).
+struct ContractWallet {
+    address: Address,
+}
+
+impl ContractWallet {
+    /// Register a contract-wallet address and fund it with `balance` of `token`.
+    fn new(env: &Env, token: &Address, balance: i128) -> Self {
+        let address = env.register(crate::StarfundEscrow, ());
+        // Mint tokens to the wallet using the SAC admin path (setup only).
+        env.mock_all_auths();
+        StellarAssetClient::new(env, token).mint(&address, &balance);
+        Self { address }
+    }
+
+    /// Build the explicit auth entry authorizing `fund(investor, amount)` on
+    /// `escrow` plus the nested token `transfer(wallet, escrow, amount)`.
+    fn fund_auth<'a>(
+        &'a self,
+        env: &'a Env,
+        escrow: &'a Address,
+        token: &'a Address,
+        amount: i128,
+    ) -> MockAuth<'a> {
+        let transfer_args = SorobanVec::from_array(
+            env,
+            [
+                self.address.into_val(env),
+                escrow.into_val(env),
+                amount.into_val(env),
+            ],
+        );
+        let sub = MockAuthInvoke {
+            contract: token,
+            fn_name: "transfer",
+            args: transfer_args,
+            sub_invokes: &[],
+        };
+        let sub_invokes: &[MockAuthInvoke] = Box::leak(Box::new([sub]));
+        MockAuth {
+            address: &self.address,
+            invoke: &MockAuthInvoke {
+                contract: escrow,
+                fn_name: "fund",
+                args: SorobanVec::from_array(
+                    env,
+                    [self.address.into_val(env), amount.into_val(env)],
+                ),
+                sub_invokes,
+            },
+        }
+    }
+}
+
+/// A supported contract wallet can fund successfully when it authorizes
+/// exactly the intended `fund` invocation and the corresponding token
+/// transfer sub-invocation.
+#[test]
+fn test_contract_wallet_fund_succeeds() {
+    let env = Env::default();
+    let (client, _admin, _sme, _treasury, token) = setup_inited_with_sac(&env);
+    let wallet = ContractWallet::new(&env, &token, 1_000i128);
+
+    let amount = 1_000i128;
+    let auth = wallet.fund_auth(&env, &client.address, &token, amount);
+    env.mock_auths(&[auth]);
+
+    client.fund(&wallet.address, &amount);
+
+    let token_client = TokenClient::new(&env, &token);
+    assert_eq!(token_client.balance(&wallet.address), 0);
+    assert_eq!(token_client.balance(&client.address), amount);
+    assert_eq!(client.get_escrow().funded_amount, amount);
+}
+
+/// An altered amount in the auth entry is rejected by the host and balances
+/// remain unchanged.
+#[test]
+fn test_contract_wallet_fund_altered_amount_rejected() {
+    let env = Env::default();
+    let (client, _admin, _sme, _treasury, token) = setup_inited_with_sac(&env);
+    let wallet = ContractWallet::new(&env, &token, 1_000i128);
+
+    // Authorize 500 but attempt to fund 1_000.
+    let auth = wallet.fund_auth(&env, &client.address, &token, 500i128);
+    env.mock_auths(&[auth]);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.fund(&wallet.address, &1_000i128);
+    }));
+    assert!(result.is_err(), "altered amount must be rejected");
+
+    let token_client = TokenClient::new(&env, &token);
+    assert_eq!(token_client.balance(&wallet.address), 1_000i128);
+    assert_eq!(token_client.balance(&client.address), 0);
+    assert_eq!(client.get_escrow().funded_amount, 0);
+}
+
+/// An auth entry targeting a different escrow invocation is rejected and
+/// balances remain unchanged.
+#[test]
+fn test_contract_wallet_fund_altered_invocation_rejected() {
+    let env = Env::default();
+    let (client, _admin, _sme, _treasury, token) = setup_inited_with_sac(&env);
+    let wallet = ContractWallet::new(&env, &token, 1_000i128);
+
+    // Authorize a `withdraw` invocation instead of `fund`.
+    let auth = MockAuth {
+        address: &wallet.address,
+        invoke: &MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "withdraw",
+            args: SorobanVec::new(&env),
+            sub_invokes: &[],
+        },
+    };
+    env.mock_auths(&[auth]);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.fund(&wallet.address, &1_000i128);
+    }));
+    assert!(result.is_err(), "altered invocation must be rejected");
+
+    let token_client = TokenClient::new(&env, &token);
+    assert_eq!(token_client.balance(&wallet.address), 1_000i128);
+    assert_eq!(token_client.balance(&client.address), 0);
+    assert_eq!(client.get_escrow().funded_amount, 0);
 }
 
 // ── partial_settle ──────────────────────────────────────────────────────
@@ -341,6 +526,115 @@ fn test_refund_wrong_signer_panics() {
         },
     }]);
     client.refund(&investor);
+}
+
+// ── get_contributions positional parity ─────────────────────────────────
+
+/// Generated positional-parity check for `get_contributions`.
+///
+/// Builds a mix of funded investors, exited (refunded) investors and unknown
+/// addresses, then reads them back through `get_contributions` in batches that
+/// include duplicates and unknowns. Every batch slot must equal the single
+/// `get_contribution` result for the address at that same input position.
+#[test]
+fn test_get_contributions_positional_parity_with_duplicates_and_unknowns() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.init(
+        &admin,
+        &SorobanString::from_str(&env, "AUTH_PARITY"),
+        &sme,
+        &1_000_000_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    // Funded investors (status 1).
+    let funded_a = Address::generate(&env);
+    let funded_b = Address::generate(&env);
+    client.fund(&funded_a, &10_000i128);
+    client.fund(&funded_b, &25_000i128);
+
+    // Exited investors: fund, then cancel funding and refund to reach status 4.
+    let exited_a = Address::generate(&env);
+    let exited_b = Address::generate(&env);
+    client.fund(&exited_a, &5_000i128);
+    client.fund(&exited_b, &7_500i128);
+    client.cancel_funding(&0u32);
+    client.refund(&exited_a);
+    client.refund(&exited_b);
+
+    // Unknown addresses that never interacted with the escrow.
+    let unknown_a = Address::generate(&env);
+    let unknown_b = Address::generate(&env);
+
+    // Build an input batch with duplicates and unknowns interleaved.
+    let inputs = SorobanVec::from_array(
+        &env,
+        [
+            funded_a.clone(),
+            unknown_a.clone(),
+            funded_b.clone(),
+            funded_a.clone(),
+            exited_a.clone(),
+            unknown_b.clone(),
+            exited_b.clone(),
+            exited_a.clone(),
+            funded_b.clone(),
+            unknown_a.clone(),
+        ],
+    );
+
+    let outputs = client.get_contributions(&inputs);
+    assert_eq!(
+        outputs.len(),
+        inputs.len(),
+        "output length must equal input length"
+    );
+
+    // Every slot must match the single getter for the same input position.
+    for i in 0..inputs.len() {
+        let addr = inputs.get(i).unwrap();
+        let expected = client.get_contribution(&addr);
+        assert_eq!(
+            outputs.get(i).unwrap(),
+            expected,
+            "batch slot {} disagrees with get_contribution",
+            i
+        );
+    }
+
+    // Duplicate positions repeat the same value.
+    assert_eq!(outputs.get(0).unwrap(), outputs.get(3).unwrap());
+    assert_eq!(outputs.get(2).unwrap(), outputs.get(8).unwrap());
+    assert_eq!(outputs.get(4).unwrap(), outputs.get(7).unwrap());
+    assert_eq!(outputs.get(1).unwrap(), outputs.get(9).unwrap());
+
+    // Unknown addresses report zero contribution.
+    assert_eq!(outputs.get(1).unwrap(), 0i128);
+    assert_eq!(outputs.get(5).unwrap(), 0i128);
+
+    // Empty input returns empty output.
+    let empty_inputs: SorobanVec<Address> = SorobanVec::new(&env);
+    let empty_outputs = client.get_contributions(&empty_inputs);
+    assert_eq!(empty_outputs.len(), 0u32);
 }
 
 // ── sweep_terminal_dust ─────────────────────────────────────────────────

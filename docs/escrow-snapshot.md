@@ -29,6 +29,26 @@ The snapshot is stored under `DataKey::FundingCloseSnapshot` and contains:
 
 Integrators can use the `get_funding_close_snapshot` getter to retrieve this metadata. For historical auditing, the `EscrowFunded` event emitted during the snapshot creation contains the `funded_amount` and `status: 1`, allowing off-chain systems to reconcile the snapshot with the event stream.
 
+## Paginated Funding Records
+
+`get_funding_records` scans the contribution index and filters out records whose balance has been reduced to zero (for example after a withdrawal). Because of this filtering, a page can be **empty before the end of the index**: the returned vector length alone is not a safe continuation signal. A client that stops on an empty page can miss later live investors.
+
+To make continuation explicit, the contract exposes a companion view, `get_funding_records_page(start, limit)`, which returns a `FundingRecordsPage`:
+
+- `records`: The live funding records found in the scanned range, in index order. This may be empty even when more records remain.
+- `next_offset`: The index offset at which the next page should start. Pass it as `start` to the next call.
+- `done`: `true` when the scan has reached the end of the contribution index; `false` when more slots remain to be scanned.
+
+### Continuation Semantics
+
+- Always continue while `done == false`, even if `records` is empty. An empty page with `done == false` still carries a valid `next_offset`.
+- Stop only when `done == true`. At that point `next_offset` equals the end of the index and no further live records exist.
+- Starting from `start = 0` and repeatedly calling `get_funding_records_page(next_offset, limit)` until `done == true` visits every live record exactly once on fixed state, regardless of how many zero-balance slots are interleaved.
+
+### Compatibility
+
+The existing `get_funding_records` getter is unchanged and remains compatible: it still returns the filtered vector of live records. New integrations should prefer `get_funding_records_page` so that sparse, empty pages do not truncate traversal.
+
 The `closed_at_ledger_timestamp` and `closed_at_ledger_sequence` fields are captured from the same ledger as the threshold-crossing funding call. Off-chain indexers should use those fields as the canonical close boundary for pro-rata reporting.
 
 ## Security Considerations

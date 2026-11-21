@@ -48,6 +48,7 @@ re-implementing storage reads to guarantee identical semantics.
 **Per-Investor State:**
 - [get_contribution](#get_contributioninvestor-address--i128)
 - [get_total_deposited](#get_total_depositedinvestor-address--i128)
+- [get_total_deposited_with_provenance](#get_total_deposited_with_provenanceinvestor-address--deposittotalview)
 - [get_unique_funder_count](#get_unique_funder_count--u32)
 - [get_investor_yield_bps](#get_investor_yield_bpsinvestor-address--i64)
 - [get_investor_claim_not_before](#get_investor_claim_not_beforeinvestor-address--u64)
@@ -638,6 +639,45 @@ withdrawals do not reduce this value.
 
 For positions stored before this key was introduced, the current contribution is the
 best available lower bound; earlier unfunds cannot be reconstructed on-chain.
+
+---
+
+### `get_total_deposited_with_provenance(investor: Address) → DepositTotalView`
+
+**Storage keys:** `DataKey::InvestorTotalDeposited(investor)` (persistent), falling back to
+`DataKey::InvestorContribution(investor)` (persistent)
+**Signature:** `pub fn get_total_deposited_with_provenance(env: Env, investor: Address) -> DepositTotalView`
+
+Companion view to [`get_total_deposited`](#get_total_depositedinvestor-address--i128) that returns the
+same numeric total **plus** its provenance, so integrators can distinguish a fully recorded cumulative
+total from a legacy contribution-only lower bound — even when the two numeric values are equal.
+
+**Requires initialization:** No
+**Storage type:** Persistent (independent TTL per address; see ADR-007)
+
+**Return value (`DepositTotalView`):**
+
+| Field | Type | Description |
+|---|---|---|
+| `total` | `i128` | The same numeric value `get_total_deposited(investor)` returns. |
+| `provenance` | `DepositTotalProvenance` | Where `total` came from (see below). |
+
+**Provenance semantics (`DepositTotalProvenance`):**
+
+| Variant | Meaning |
+|---|---|
+| `Recorded` | `DataKey::InvestorTotalDeposited(investor)` is present; `total` is the complete recorded cumulative deposit sum. |
+| `Fallback` | The cumulative key is absent but the investor has a non-zero contribution; `total` is the current `get_contribution(investor)` value, a legacy lower bound (earlier unfunds cannot be reconstructed on-chain). |
+| `Unknown` | The investor has neither a cumulative key nor a contribution; `total` is `0` and the account has no recorded position. |
+
+**Notes:**
+- `get_total_deposited` is **unchanged**: it still returns the bare `i128` total with the same fallback
+  behavior. This view is purely additive and compatible.
+- `total` always equals `get_total_deposited(investor)` for the same address, so the two views can never
+  disagree numerically; only the provenance differs.
+- `Unknown` is reported explicitly rather than being conflated with a recorded zero, so consumers can
+  tell "never funded" apart from "funded and fully unwound".
+- **Pure read** — no authorization required, no state mutation, no TTL extension.
 
 ---
 

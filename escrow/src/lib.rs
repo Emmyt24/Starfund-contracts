@@ -5072,6 +5072,45 @@ impl StarfundEscrow {
         Self::get_persistent_investor_total_deposited(&env, investor)
     }
 
+    /// Companion view to [`StarfundEscrow::get_total_deposited`] that reports the
+    /// **provenance** of the returned cumulative total.
+    ///
+    /// The numeric getter cannot distinguish a recorded cumulative total from the
+    /// legacy contribution fallback when both values are equal. This view makes the
+    /// distinction explicit without changing the existing getter:
+    ///
+    /// - [`DepositTotalProvenance::Recorded`] ΓÇö the cumulative total key exists; `total`
+    ///   is the recorded value.
+    /// - [`DepositTotalProvenance::Fallback`] ΓÇö the cumulative total key is absent but a
+    ///   positive contribution exists; `total` is that contribution (a lower bound, since
+    ///   earlier withdrawals cannot be reconstructed on-chain).
+    /// - [`DepositTotalProvenance::Unknown`] ΓÇö neither key exists; `total` is `0` and the
+    ///   account has no recorded deposit history.
+    ///
+    /// Pure read: no auth, no storage writes.
+    pub fn get_total_deposited_with_provenance(env: Env, investor: Address) -> DepositTotalView {
+        let total_key = keys::investor_total_deposited(investor.clone());
+        if let Some(total) = env.storage().persistent().get::<_, i128>(&total_key) {
+            return DepositTotalView {
+                total,
+                provenance: DepositTotalProvenance::Recorded,
+            };
+        }
+
+        let contribution = Self::get_persistent_investor_contribution(&env, investor);
+        if contribution > 0 {
+            DepositTotalView {
+                total: contribution,
+                provenance: DepositTotalProvenance::Fallback,
+            }
+        } else {
+            DepositTotalView {
+                total: 0,
+                provenance: DepositTotalProvenance::Unknown,
+            }
+        }
+    }
+
     /// Public API: contributions recorded for `investors` in the same order as the input.
     ///
     /// This bounded read batches the same persistent-storage lookup used by
@@ -5215,6 +5254,63 @@ impl StarfundEscrow {
             });
         }
         result
+    }
+
+    /// Companion page view to [`StarfundEscrow::get_funding_records`] that makes the
+    /// pagination continuation **explicit**.
+    ///
+    /// [`StarfundEscrow::get_funding_records`] scans investor-index slots and filters
+    /// out zero-contribution slots, so a page can be empty (or short) before the end of
+    /// the index. Output length alone is therefore not a safe continuation signal.
+    ///
+    /// This view scans index slots starting at `start`, collecting up to `limit`
+    /// (clamped to [`MAX_INVESTOR_READ_BATCH`]) live records, and reports:
+    ///
+    /// - `records` ΓÇö the live [`FundingRecord`]s found in this scan window.
+    /// - `next_offset` ΓÇö the index slot to pass as `start` on the next call.
+    /// - `done` ΓÇö `true` when the end of the investor index has been reached, so no
+    ///   further pages exist. When `done` is `false`, callers must continue from
+    ///   `next_offset` even if `records` is empty.
+    ///
+    /// Concatenating `records` across calls until `done` visits every live record
+    /// exactly once on fixed state. Pure read: no auth, no storage writes.
+    pub fn get_funding_records_page(env: Env, start: u32, limit: u32) -> FundingRecordsPage {
+        let index: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::InvestorIndex)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let len = index.len();
+        let mut records = Vec::new(&env);
+
+        if start >= len || limit == 0 {
+            return FundingRecordsPage {
+                records,
+                next_offset: len,
+                done: true,
+            };
+        }
+
+        let actual_limit = limit.min(MAX_INVESTOR_READ_BATCH);
+        let mut i = start;
+        while i < len && records.len() < actual_limit {
+            let investor = index.get(i).unwrap();
+            let contribution = Self::get_persistent_investor_contribution(&env, investor.clone());
+            if contribution > 0 {
+                records.push_back(FundingRecord {
+                    investor,
+                    contribution,
+                });
+            }
+            i += 1;
+        }
+
+        FundingRecordsPage {
+            records,
+            next_offset: i,
+            done: i >= len,
+        }
     }
 
     /// Pro-rata denominator captured when the escrow first became **funded**; [`None`] until then.
@@ -10764,6 +10860,49 @@ pub struct ReconciliationView {
     /// (a surplus); negative means the contract is in deficit for its remaining
     /// obligations.
     pub surplus: i128,
+}
+
+/// Provenance of the cumulative total returned by
+/// [`StarfundEscrow::get_total_deposited_with_provenance`].
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepositTotalProvenance {
+    /// The cumulative total key exists; the value is recorded history.
+    Recorded = 0,
+    /// The cumulative total key is absent; the value is the current contribution,
+    /// a legacy lower bound.
+    Fallback = 1,
+    /// Neither the cumulative total nor a contribution exists for this account.
+    Unknown = 2,
+}
+
+/// Read-only view returned by [`StarfundEscrow::get_total_deposited_with_provenance`].
+///
+/// Carries the same numeric `total` as [`StarfundEscrow::get_total_deposited`] plus
+/// the [`DepositTotalProvenance`] that explains how it was derived.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DepositTotalView {
+    /// Cumulative deposited total (or the fallback value described by `provenance`).
+    pub total: i128,
+    /// How `total` was derived.
+    pub provenance: DepositTotalProvenance,
+}
+
+/// Read-only page returned by [`StarfundEscrow::get_funding_records_page`].
+///
+/// Unlike the bare [`StarfundEscrow::get_funding_records`] vector, this page always
+/// carries an explicit continuation: `next_offset` is the index slot to resume from
+/// and `done` indicates whether the end of the investor index has been reached.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FundingRecordsPage {
+    /// Live funding records found in this scan window (all have `contribution > 0`).
+    pub records: Vec<FundingRecord>,
+    /// Investor-index slot to pass as `start` on the next call.
+    pub next_offset: u32,
+    /// `true` when the end of the investor index has been reached.
+    pub done: bool,
 }
 
 // Test module tree: submodules are reconciled with the current lib API and
